@@ -1,0 +1,494 @@
+from typing import Tuple, List, Dict, Optional
+from dataclasses import dataclass
+import math
+import torch
+import copy
+import torch.nn.functional as F
+from torch import nn
+from pydantic import BaseModel
+import random
+from models.common import trunc_normal_init_
+from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.sparse_embedding import CastedSparseEmbedding
+
+IGNORE_LABEL_ID = -100
+
+@dataclass
+class TinyRecursiveReasoningModel_ACTV1InnerCarry:
+    z_H: torch.Tensor
+    z_L: torch.Tensor
+
+
+@dataclass
+class TinyRecursiveReasoningModel_ACTV1Carry:
+    inner_carry: TinyRecursiveReasoningModel_ACTV1InnerCarry
+    
+    steps: torch.Tensor
+    halted: torch.Tensor
+    
+    current_data: Dict[str, torch.Tensor]
+
+
+class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
+    batch_size: int
+    seq_len: int
+    puzzle_emb_ndim: int = 0
+    num_puzzle_identifiers: int
+    vocab_size: int
+
+    H_cycles: int
+    L_cycles: int
+
+    H_layers: int # ignored
+    L_layers: int
+
+    # Transformer config
+    hidden_size: int
+    expansion: float
+    num_heads: int
+    pos_encodings: str
+
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 10000.0
+    
+    # Halting Q-learning config
+    halt_max_steps: int
+    halt_exploration_prob: float
+
+    forward_dtype: str = "bfloat16"
+
+    # Alexia: added
+    mlp_t: bool = False # use mlp on L instead of transformer
+    puzzle_emb_len: int = 16 # if non-zero, its specified to this value
+    no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+
+    # Variational parameters
+    latent_dim: int = 256
+    kl_coef: float = 0.1
+    use_mlp_sampler: bool = False  # Use MLP for prior/posterior instead of linear projection
+    version: str = "v1"  # version of variational TRM (v1 or v2 ...)
+    middle_latent: str = "prior"
+
+    # Variational sampling control (for ablation)
+    fix_mu: bool = False  # If True, force mu = 0 (both prior and posterior)
+    fix_std: bool = False  # If True, force std = 0, deterministic (both prior and posterior)
+
+    # Decoder parameters
+    use_mlp_lm_head: bool = False  # Use MLP decoder (SwiGLU) instead of linear projection
+
+    # Value head parameters
+    use_value_head: bool = False  # Add value head to predict current state accuracy
+
+
+class VariationalLayer(nn.Module):
+    """Variational layer with optional MLP encoders"""
+    def __init__(self, hidden_size: int, latent_dim: int, vocab_size: int, use_mlp: bool = False, expansion: float = 2.0,
+                 fix_mu: bool = False, fix_std: bool = False):
+        super().__init__()
+        self.use_mlp = use_mlp
+        self.fix_mu = fix_mu
+        self.fix_std = fix_std
+
+        if use_mlp:
+            # Prior: p(z|x) - MLP encoder outputs 2*latent_dim (mu and logvar)
+            self.prior_mlp = SwiGLU(hidden_size, expansion, out_dim=2 * latent_dim)
+
+            # Posterior: q(z|x, y) - MLP encoder outputs 2*latent_dim (mu and logvar)
+            self.post_mlp = SwiGLU(hidden_size + vocab_size, expansion, out_dim=2 * latent_dim)
+
+            # Project z back to hidden_size
+            self.z_proj = nn.Linear(latent_dim, hidden_size)
+        else:
+            # Prior: p(z|x) - Linear projection
+            self.prior_mu = nn.Linear(hidden_size, latent_dim)
+            self.prior_logvar = nn.Linear(hidden_size, latent_dim)
+
+            # Posterior: q(z|x, y) - Linear projection
+            self.post_mu = nn.Linear(hidden_size + vocab_size, latent_dim)
+            self.post_logvar = nn.Linear(hidden_size + vocab_size, latent_dim)
+
+            # Project z back to hidden_size
+            self.z_proj = nn.Linear(latent_dim, hidden_size)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def sample_prior(self, x):
+        B, N, D = x.shape
+        h = x.reshape(B * N, D).to(torch.float32)  # (B*N, D)
+
+        if self.use_mlp:
+            mlp_out = self.prior_mlp(h)  # (B*N, 2*latent_dim)
+            mu, logvar = mlp_out.chunk(2, dim=-1)  # Each (B*N, latent_dim)
+        else:
+            mu = self.prior_mu(h)  # (B*N, latent_dim)
+            logvar = self.prior_logvar(h)  # (B*N, latent_dim)
+
+        # Apply ablation flags
+        if self.fix_mu:
+            mu = torch.zeros_like(mu)
+        if self.fix_std:
+            logvar = torch.full_like(logvar, -1e10)  # std ≈ 0
+
+        z = self.reparameterize(mu, logvar)  # (B*N, latent_dim)
+
+        # Reshape back to (B, N, latent_dim)
+        mu = mu.reshape(B, N, -1)
+        logvar = logvar.reshape(B, N, -1)
+        z = z.reshape(B, N, -1)
+        return z, mu, logvar
+
+    def sample_posterior(self, x, y):
+        B, N, D1 = x.shape
+        _, _, D2 = y.shape
+        assert N == y.shape[1], "Sequence length mismatch between x and y"
+        h = x.reshape(B * N, D1).to(torch.float32)  # (B*N, D)
+        y_flat = y.reshape(B * N, D2).to(torch.float32)  # (B*N, D)
+        combined = torch.cat([h, y_flat], dim=-1)  # (B*N, D+vocab_size)
+
+        if self.use_mlp:
+            mlp_out = self.post_mlp(combined)  # (B*N, 2*latent_dim)
+            mu, logvar = mlp_out.chunk(2, dim=-1)  # Each (B*N, latent_dim)
+        else:
+            mu = self.post_mu(combined)  # (B*N, latent_dim)
+            logvar = self.post_logvar(combined)  # (B*N, latent_dim)
+
+        # Apply ablation flags
+        if self.fix_mu:
+            mu = torch.zeros_like(mu)
+        if self.fix_std:
+            logvar = torch.full_like(logvar, -1e10)  # std ≈ 0
+
+        z = self.reparameterize(mu, logvar)  # (B*N, latent_dim)
+
+        # Reshape back to (B, N, latent_dim)
+        mu = mu.reshape(B, N, -1)
+        logvar = logvar.reshape(B, N, -1)
+        z = z.reshape(B, N, -1)
+        return z, mu, logvar
+
+
+class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
+    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+        super().__init__()
+
+        self.config = config
+        if self.config.mlp_t:
+            self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+            self.mlp_t = SwiGLU(
+                hidden_size=self.config.seq_len + self.puzzle_emb_len, # L
+                expansion=config.expansion,
+            )
+        else:
+            self.self_attn = Attention(
+                hidden_size=config.hidden_size,
+                head_dim=config.hidden_size // config.num_heads,
+                num_heads=config.num_heads,
+                num_key_value_heads=config.num_heads,
+                causal=False
+            )
+        self.mlp = SwiGLU(
+            hidden_size=config.hidden_size,
+            expansion=config.expansion,
+        )
+        self.norm_eps = config.rms_norm_eps
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        # B, L, D = hidden_states.shape
+        # Post Norm
+        if self.config.mlp_t:
+            hidden_states = hidden_states.transpose(1,2)
+            out = self.mlp_t(hidden_states)
+            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+            hidden_states = hidden_states.transpose(1,2)
+        else:
+            # Self Attention
+            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+        # Fully Connected
+        out = self.mlp(hidden_states)
+        hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+        return hidden_states
+
+class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
+    def __init__(self, layers: List[TinyRecursiveReasoningModel_ACTV1Block]):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(layers)
+
+    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+        hidden_states = hidden_states + input_injection
+        for layer in self.layers:
+            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+        return hidden_states
+
+
+class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
+    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+        super().__init__()
+        self.config = config
+        self.forward_dtype = getattr(torch, self.config.forward_dtype)
+
+        # I/O
+
+        self.embed_scale = math.sqrt(self.config.hidden_size)
+        embed_init_std = 1.0 / self.embed_scale
+
+        self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+
+        # LM head: linear or MLP decoder
+        if self.config.use_mlp_lm_head:
+            self.lm_head = SwiGLU(self.config.hidden_size, self.config.expansion, out_dim=self.config.vocab_size)
+        else:
+            self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+
+        self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
+
+        # Value head (optional)
+        if self.config.use_value_head:
+            self.value_head = CastedLinear(self.config.hidden_size, 1, bias=True)
+
+        # Variational layer
+        self.variational = VariationalLayer(
+            self.config.hidden_size,
+            self.config.latent_dim,
+            self.config.vocab_size,
+            use_mlp=self.config.use_mlp_sampler,
+            fix_mu=self.config.fix_mu,
+            fix_std=self.config.fix_std
+        )
+
+        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
+        if self.config.puzzle_emb_ndim > 0:
+            # Zero init puzzle embeddings
+            self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
+                                                    batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype)
+
+        # LM Blocks
+        if self.config.pos_encodings == "rope":
+            self.rotary_emb = RotaryEmbedding(dim=self.config.hidden_size // self.config.num_heads,
+                                              max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
+                                              base=self.config.rope_theta)
+        elif self.config.pos_encodings == "learned":
+            self.embed_pos = CastedEmbedding(self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        else:
+            pass
+
+        # Reasoning Layers
+        self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+
+        # Initial states
+        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+
+        # Q head special init
+        # Init Q to (almost) zero for faster learning during bootstrapping
+        with torch.no_grad():
+            self.q_head.weight.zero_()
+            self.q_head.bias.fill_(-5)  # type: ignore
+
+    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
+        # Token embedding
+        embedding = self.embed_tokens(input.to(torch.int32))
+
+        # Puzzle embeddings
+        if self.config.puzzle_emb_ndim > 0:
+            puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
+            
+            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+            if pad_count > 0:
+                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+
+            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
+
+        # Position embeddings
+        if self.config.pos_encodings == "learned":
+            # scale by 1/sqrt(2) to maintain forward variance
+            embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
+
+        # Scale
+        return self.embed_scale * embedding
+
+    def empty_carry(self, batch_size: int):
+        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+        )
+        
+    def reset_carry(self, reset_flag: torch.Tensor, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry):
+        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
+            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+        )
+
+    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        seq_info = dict(
+            cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
+        )
+
+        # Input encoding
+        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+
+        # Forward iterations
+        it = 0
+        z_H, z_L = carry.z_H, carry.z_L
+        # H_cycles-1 without grad
+        with torch.no_grad():
+            for _H_step in range(self.config.H_cycles-1):
+                for _L_step in range(self.config.L_cycles):
+                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                z_H = self.L_level(z_H, z_L, **seq_info)
+
+                if self.config.version in ['v2', 'v2.5', 'v3', 'v3.5'] and self.config.middle_latent in ["prior", "posterior"]: # variational in the middle of cycles
+                    puzzle_emb = z_H[:, :self.puzzle_emb_len]
+                    h_t = z_H[:, self.puzzle_emb_len:]
+                    l_t = z_L[:, self.puzzle_emb_len:]
+                    sample_in = (h_t + l_t) if self.config.version in ['v3', 'v3.5'] else h_t
+
+                    if self.training and (self.config.middle_latent == "posterior"):
+                        y_tar = F.one_hot(batch["labels"].long(), num_classes=self.config.vocab_size).to(torch.float32)
+                        z_post, post_mu, post_logvar = self.variational.sample_posterior(sample_in, y_tar)
+                        z = z_post
+                    else:
+                        z_pred, prior_mu, prior_logvar = self.variational.sample_prior(sample_in)
+                        z = z_pred
+                    # Decode: condition h_T on z (per-token z)
+                    B, N, _ = z.shape
+                    z_flat = z.reshape(B * N, -1)  # (B*N, latent_dim)
+                    z_proj_flat = self.variational.z_proj(z_flat)  # (B*N, hidden_size)
+                    z = z_proj_flat.reshape(B, N, -1).to(self.forward_dtype)  # (B, N, D)
+                    h_t_conditioned = z if self.config.version in ['v2.5', 'v3.5'] else h_t + z
+                    z_H = torch.cat([puzzle_emb, h_t_conditioned], dim=1)
+
+        # 1 with grad
+        for _L_step in range(self.config.L_cycles):
+            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+        z_H = self.L_level(z_H, z_L, **seq_info)
+
+        
+        # to match pseudocode
+        puzzle_emb = z_H[:, :self.puzzle_emb_len]
+        h_T = z_H[:, self.puzzle_emb_len:]
+        l_T = z_L[:, self.puzzle_emb_len:]
+        sample_in = (h_T + l_T) if self.config.version in ['v3', 'v3.5'] else h_T
+        # Variational sampling
+        vae_outputs = {}
+        z_pred, prior_mu, prior_logvar = self.variational.sample_prior(sample_in)
+        vae_outputs['prior_mu'] = prior_mu
+        vae_outputs['prior_logvar'] = prior_logvar
+
+        if self.training:
+            # Sample from posterior q(z|h_T, y_tar)
+            y_tar = F.one_hot(batch["labels"].long(), num_classes=self.config.vocab_size).to(torch.float32)
+            z_post, post_mu, post_logvar = self.variational.sample_posterior(sample_in, y_tar)
+            vae_outputs['post_mu'] = post_mu
+            vae_outputs['post_logvar'] = post_logvar
+            z = z_post
+        else:
+            z = z_pred
+
+        # Decode: condition h_T on z (per-token z)
+        B, N, _ = z.shape
+        z_flat = z.reshape(B * N, -1)  # (B*N, latent_dim)
+        z_proj_flat = self.variational.z_proj(z_flat)  # (B*N, hidden_size)
+        z = z_proj_flat.reshape(B, N, -1).to(self.forward_dtype)  # (B, N, D)
+        h_T_conditioned = z if self.config.version == 'v3.5' else h_T + z  # (B, N, D)
+
+        # LM Outputs
+        if self.config.version == 'v1':
+            new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+        elif self.config.version in ['v2', 'v2.5', 'v3', 'v3.5']:
+            z_H_conditioned = torch.cat([puzzle_emb, h_T_conditioned], dim=1)
+            new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H_conditioned.detach(), z_L=z_L.detach())
+        output = self.lm_head(h_T_conditioned)
+        q_logits = self.q_head(puzzle_emb[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
+
+        # Value head (optional): predict current state accuracy from mean-pooled h_T
+        value_pred = None
+        if self.config.use_value_head:
+            h_T_mean = h_T_conditioned.mean(dim=1)  # (B, hidden_size)
+            value_pred = torch.sigmoid(self.value_head(h_T_mean).to(torch.float32)).squeeze(-1)  # (B,) in [0, 1]
+
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), vae_outputs, value_pred
+
+
+class TinyRecursiveReasoningModel_ACTV1(nn.Module):
+    """ACT wrapper."""
+
+    def __init__(self, config_dict: dict):
+        super().__init__()
+        self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)
+        print("Initializing TRM with config:", self.config)
+        assert self.config.middle_latent in ["prior", "posterior", "none"], "middle_latent must be one of prior/posterior/none"
+        self.inner = TinyRecursiveReasoningModel_ACTV1_Inner(self.config)
+
+    @property
+    def puzzle_emb(self):
+        return self.inner.puzzle_emb
+
+    def initial_carry(self, batch: Dict[str, torch.Tensor]):
+        batch_size = batch["inputs"].shape[0]
+
+        return TinyRecursiveReasoningModel_ACTV1Carry(
+            inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
+            
+            steps=torch.zeros((batch_size, ), dtype=torch.int32),
+            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
+            
+            current_data={k: torch.empty_like(v) for k, v in batch.items()}
+        )
+        
+    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
+
+        # Update data, carry (removing halted sequences)
+        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
+        
+        new_steps = torch.where(carry.halted, 0, carry.steps)
+
+        new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
+
+        # Forward inner model
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), vae_outputs, value_pred = self.inner(new_inner_carry, new_current_data)
+
+        outputs = {
+            "logits": logits,
+            "q_halt_logits": q_halt_logits,
+            "q_continue_logits": q_continue_logits,
+            **vae_outputs  # Add VAE outputs for loss computation
+        }
+
+        # Add value prediction if available
+        if value_pred is not None:
+            outputs["value_pred"] = value_pred
+
+        with torch.no_grad():
+            # Step
+            new_steps = new_steps + 1
+            is_last_step = new_steps >= self.config.halt_max_steps
+            
+            halted = is_last_step
+
+            # if training, and ACT is enabled
+            if self.training and (self.config.halt_max_steps > 1):
+
+                # Halt signal
+                # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
+                
+                if self.config.no_ACT_continue:
+                    halted = halted | (q_halt_logits > 0)
+                else:
+                    halted = halted | (q_halt_logits > q_continue_logits)
+
+                # Exploration
+                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
+                halted = halted & (new_steps >= min_halt_steps)
+
+                if not self.config.no_ACT_continue:
+                    # Compute target Q
+                    # NOTE: No replay buffer and target networks for computing target Q-value.
+                    # As batch_size is large, there're many parallel envs.
+                    # Similar concept as PQN https://arxiv.org/abs/2407.04811
+                    _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
+                    outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+
+        return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs

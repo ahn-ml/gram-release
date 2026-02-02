@@ -1,0 +1,7 @@
+**/outputs/
+**/cache/
+**/__pycache__/
+**/checkpoints/
+**/data/
+**/wandb/
+*.log
