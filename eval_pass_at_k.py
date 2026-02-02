@@ -59,68 +59,6 @@ def make_pass_ks(num_samples, filter_augmentation=False):
         pass_Ks = [1, 2, 5, 10, 20, 100, 250, 500, 1000]
     return pass_Ks
 
-def viz_maze_samples(batch, samples, idx, out_dir="maze_viz", num_puzzles=5):
-    """Visualize multiple puzzles with predictions."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from evaluators.maze_utils import verify_maze_path
-
-    os.makedirs(out_dir, exist_ok=True)
-    B = batch["inputs"].shape[0]
-    num_show = min(B, num_puzzles)
-    K = len(samples)
-    n = int(np.sqrt(batch["inputs"].shape[1]))
-
-    fig = plt.figure(figsize=(3 * (K + 1), 3 * num_show))
-
-    total_valid = 0
-    total_samples = 0
-
-    for puzzle_idx in range(num_show):
-        inp = batch["inputs"][puzzle_idx].cpu().numpy()
-        gt = batch["labels"][puzzle_idx].cpu().numpy()
-        inp_2d, gt_2d = inp.reshape(n, n), gt.reshape(n, n)
-
-        # GT
-        ax = fig.add_subplot(num_show, K + 1, puzzle_idx * (K + 1) + 1)
-        vis = np.ones((n, n, 3), dtype=np.float32)
-        vis[inp_2d == 1] = [0, 0, 0]
-        vis[gt_2d == 5] = [0.3, 0.5, 1.0]
-        vis[gt_2d == 3] = [0, 1, 0]
-        vis[gt_2d == 4] = [1, 0, 0]
-        ax.imshow(vis, interpolation='nearest')
-        ax.set_title(f"P{puzzle_idx} GT", fontsize=9)
-        ax.axis('off')
-
-        # Predictions
-        for k in range(K):
-            pred = samples[k]["preds"][puzzle_idx].cpu().numpy()
-            is_valid = verify_maze_path(inp, pred)
-            total_valid += is_valid
-            total_samples += 1
-
-            ax = fig.add_subplot(num_show, K + 1, puzzle_idx * (K + 1) + k + 2)
-            vis = np.ones((n, n, 3), dtype=np.float32)
-            vis[inp_2d == 1] = [0, 0, 0]
-            p2d = pred.reshape(n, n)
-            vis[p2d == 5] = [0.3, 0.5, 1.0]
-            vis[p2d == 3] = [0, 1, 0]
-            vis[p2d == 4] = [1, 0, 0]
-            ax.imshow(vis, interpolation='nearest')
-            ax.set_title(f"S{k+1} {'✓' if is_valid else '✗'}", fontsize=9)
-            ax.axis('off')
-            for spine in ax.spines.values():
-                spine.set_edgecolor('green' if is_valid else 'red')
-                spine.set_linewidth(3)
-
-    plt.suptitle(f"Batch {idx}: {total_valid}/{total_samples} Valid (BFS)", fontsize=12, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(f"{out_dir}/batch_{idx:03d}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved: {out_dir}/batch_{idx:03d}.png ({num_show} puzzles, {total_valid}/{total_samples} valid)")
-
-
 def viz_nqueens_samples(batch, samples, batch_idx, out_dir="nqueens_viz", num_puzzles=5, multi_sol_only=False):
     """Visualize N-Queens puzzles with deduplicated samples.
     
@@ -471,8 +409,7 @@ def main():
     data_path = data_paths[0] if data_paths else config.data_paths[0]
     is_arc = 'arc' in data_path.lower()
     is_sudoku = 'sudoku' in data_path.lower()
-    is_maze = 'maze' in data_path.lower()
-    
+
     pass_Ks= make_pass_ks(args.num_samples, filter_augmentation=args.filter_augmented if is_arc else True)
     if is_arc:
         from evaluators.arc_pass_k import ARC
@@ -494,18 +431,6 @@ def main():
         inverse_aug = None
         evaluators = [
             Sudoku(
-                data_path=data_path,
-                eval_metadata=eval_metadata,
-                pass_Ks=pass_Ks,
-                aggregated_voting=True
-            )
-        ]
-    elif "maze" in data_path.lower():
-        if rank == 0:
-            print("Creating Maze pass@k evaluator...")
-        from evaluators.maze import Maze
-        evaluators = [
-            Maze(
                 data_path=data_path,
                 eval_metadata=eval_metadata,
                 pass_Ks=pass_Ks,
@@ -541,7 +466,7 @@ def main():
             )
         ]
     else:
-        raise ValueError(f"Unknown dataset type in path: {data_path}. Expected 'sudoku', 'maze', 'arc', 'nqueen', or 'graph-coloring'.")
+        raise ValueError(f"Unknown dataset type in path: {data_path}. Expected 'sudoku', 'arc', 'nqueen', or 'graph-coloring'.")
 
     # Load model
     if rank == 0:
@@ -696,14 +621,6 @@ def main():
                     model, batch, args.num_samples, return_keys, device,
                     extract_h_states=(value_network is not None or args.use_online_value_head), data_path=data_path.lower()
                 )
-
-            # Visualize maze predictions (if enabled)
-            if args.visualize and rank == 0 and "maze" in data_path.lower():
-                if not hasattr(viz_maze_samples, '_batch_count'):
-                    viz_maze_samples._batch_count = 0
-                if viz_maze_samples._batch_count < 5:
-                    viz_maze_samples(batch, batch_samples, viz_maze_samples._batch_count)
-                    viz_maze_samples._batch_count += 1
 
             # Visualize N-Queens predictions (if enabled)
             if (args.visualize or args.visualize_multi_sol) and rank == 0 and "nqueen" in data_path.lower():

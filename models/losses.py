@@ -3,7 +3,6 @@ from typing import Any, Tuple, Dict, Sequence, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
-import math
 
 IGNORE_LABEL_ID = -100
 
@@ -37,76 +36,15 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
     return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
 
 
-def softmax_focal_loss(logits, labels, ignore_index: int = -100, gamma: float = 2.0, alpha: Optional[torch.Tensor] = None, valid_mask=None):
-    """
-    Focal Loss for multi-class classification (softmax version).
-    Based on RetinaNet paper: https://arxiv.org/abs/1708.02002 (Lin et al., 2017)
-    Adapted from detectron2's sigmoid_focal_loss to softmax.
-
-    FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
-
-    Args:
-        logits: (B, SeqLen, VocabSize) unnormalized predictions
-        labels: (B, SeqLen) ground truth class indices
-        ignore_index: label value to ignore (default: -100)
-        gamma: focusing parameter (default: 2.0). Higher = more focus on hard examples
-        alpha: (VocabSize,) optional class weights. If None, no class weighting
-        valid_mask: optional boolean mask for valid positions
-
-    Returns:
-        loss: (B, SeqLen) per-token focal loss
-    """
-    logits = logits.float()
-
-    # Compute probabilities
-    p = F.softmax(logits, dim=-1)  # (B, SeqLen, VocabSize)
-
-    # Create mask
-    if valid_mask is None:
-        valid_mask = (labels != ignore_index)
-
-    # Get probability of correct class p_t
-    labels_clamped = torch.where(valid_mask, labels.long(), 0)
-    p_t = torch.gather(p, dim=-1, index=labels_clamped.unsqueeze(-1)).squeeze(-1)  # (B, SeqLen)
-
-    # Focal weight: (1 - p_t)^gamma
-    focal_weight = (1 - p_t) ** gamma
-
-    # Cross-entropy: -log(p_t)
-    ce_loss = F.cross_entropy(
-        logits.view(-1, logits.shape[-1]),
-        labels_clamped.view(-1),
-        reduction='none'
-    ).view(labels.shape)
-
-    # Focal loss
-    loss = focal_weight * ce_loss
-
-    # Optional class weighting (alpha_t)
-    if alpha is not None:
-        alpha_t = torch.gather(alpha.to(logits.device), dim=0, index=labels_clamped.view(-1)).view(labels.shape)
-        loss = alpha_t * loss
-
-    # Mask invalid positions
-    loss = torch.where(valid_mask, loss, torch.zeros_like(loss))
-
-    return loss
-
-
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str, kl_coef: float = 0.0, kl_balance_alpha: Optional[float] = None, free_bits: Optional[float] = None, value_coef: float = 1.0, focal_gamma: float = 2.0, focal_alpha: Optional[torch.Tensor] = None, reinforce_coef: float = 0.0, length_penalty_coef: float = 0.0, data_path: Optional[str] = None):
+    def __init__(self, model: nn.Module, loss_type: str, kl_coef: float = 0.0, kl_balance_alpha: Optional[float] = None, free_bits: Optional[float] = None, value_coef: float = 1.0, data_path: Optional[str] = None):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
-        self.loss_type = loss_type
         self.kl_coef = kl_coef
         self.kl_balance_alpha = kl_balance_alpha  # If not None, use KL balancing (e.g., 0.8)
         self.free_bits = free_bits  # If not None, apply free bits to KL (e.g., 0.1)
         self.value_coef = value_coef  # Coefficient for value loss
-        self.focal_gamma = focal_gamma  # Focal loss gamma parameter
-        self.focal_alpha = focal_alpha  # Focal loss class weights
-        self.reinforce_coef = reinforce_coef  # Coefficient for REINFORCE loss (global)
-        self.length_penalty_coef = length_penalty_coef  # Length penalty for path efficiency
 
         # Detect task type from data_path for task-specific verification
         self.is_nqueen = False
@@ -115,11 +53,6 @@ class ACTLossHead(nn.Module):
             data_path_lower = data_path.lower()
             self.is_nqueen = 'nqueen' in data_path_lower
             self.is_graph_coloring = 'graph-coloring' in data_path_lower or 'graph_coloring' in data_path_lower
-
-        # REINFORCE baseline for variance reduction
-        if self.reinforce_coef > 0:
-            self.register_buffer('reward_baseline', torch.tensor(0.5))
-            self.baseline_momentum = 0.99
 
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
@@ -183,12 +116,7 @@ class ACTLossHead(nn.Module):
             }
 
         # Losses
-
-        # Pass focal loss parameters if using focal loss
-        if self.loss_type == "softmax_focal_loss":
-            lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, gamma=self.focal_gamma, alpha=self.focal_alpha, valid_mask=mask) / loss_divisor).sum()
-        else:
-            lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
         metrics.update({
             "lm_loss": lm_loss.detach(),
@@ -244,53 +172,8 @@ class ACTLossHead(nn.Module):
             metrics["value_loss"] = value_loss.detach()
             metrics["value_mae"] = (outputs["value_pred"] - current_accuracy).abs().mean().detach()
 
-        # REINFORCE loss (global sequence-level correctness)
-        reinforce_loss = 0
-        if self.reinforce_coef > 0 and self.model.training:
-            # Import BFS verification
-            from evaluators.maze_utils import batch_verify_maze
-
-            # Use greedy predictions
-            logits = outputs["logits"]  # (B, N, V)
-            preds = outputs["preds"]  # (B, N) - argmax predictions
-
-            # Get log probabilities of greedy predictions
-            log_probs = F.log_softmax(logits, dim=-1)  # (B, N, V)
-            preds_log_probs = torch.gather(
-                log_probs,
-                dim=-1,
-                index=preds.unsqueeze(-1)
-            ).squeeze(-1)  # (B, N)
-
-            # Get reward from BFS verification (entire path correct?)
-            inputs = new_carry.current_data["inputs"]
-            validity = batch_verify_maze(inputs, preds).float()  # (B,) - 1.0 if valid, 0.0 otherwise
-
-            # Count path length (number of path cells: tokens 3, 4, 5 = start/goal/path)
-            # For mazes: vocab is [empty=0, wall=1, obstacle=2, start=3, goal=4, path=5]
-            is_path_cell = (preds >= 3) & (preds <= 5)  # (B, N)
-            path_lengths = is_path_cell.sum(dim=-1).float()  # (B,)
-
-            # Compute reward: validity - length_penalty
-            rewards = validity - self.length_penalty_coef * path_lengths  # (B,)
-
-            # Update baseline (EMA)
-            with torch.no_grad():
-                self.reward_baseline.mul_(self.baseline_momentum).add_(rewards.mean() * (1 - self.baseline_momentum))
-
-            # REINFORCE: -log_prob * (reward - baseline)
-            advantages = rewards - self.reward_baseline  # (B,)
-            reinforce_loss = -(preds_log_probs * mask.float()).sum(-1) * advantages  # (B,)
-            reinforce_loss = reinforce_loss.sum()  # Sum over batch
-
-            metrics["reinforce_loss"] = reinforce_loss.detach()
-            metrics["reward_mean"] = rewards.mean().detach()
-            metrics["reward_validity"] = validity.mean().detach()
-            metrics["reward_path_length"] = path_lengths.mean().detach()
-            metrics["reward_baseline"] = self.reward_baseline.detach()
-
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + self.kl_coef * kl_loss + self.value_coef * value_loss + self.reinforce_coef * reinforce_loss, metrics, detached_outputs, new_carry.halted.all()
+        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + self.kl_coef * kl_loss + self.value_coef * value_loss, metrics, detached_outputs, new_carry.halted.all()
 

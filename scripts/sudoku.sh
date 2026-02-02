@@ -2,7 +2,7 @@
 # export DISABLE_COMPILE=1
 run_name="pretrain_mlp_sudoku_varitrm_v3_prior_50k_mlpsam_valhead"
 torchrun --nproc-per-node 8 --rdzv_backend=c10d --rdzv_endpoint=localhost:0 --nnodes=1 pretrain.py \
-arch=trm_variational \
+arch=gram \
 seed=42 \
 global_batch_size=768 \
 data_paths="[data/sudoku-extreme-1k-aug-1000]" \

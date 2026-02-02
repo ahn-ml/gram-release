@@ -14,14 +14,14 @@ from models.sparse_embedding import CastedSparseEmbedding
 IGNORE_LABEL_ID = -100
 
 @dataclass
-class TinyRecursiveReasoningModel_ACTV1InnerCarry:
+class GenerativeRecursiveReasoningModelInnerCarry:
     z_H: torch.Tensor
     z_L: torch.Tensor
 
 
 @dataclass
-class TinyRecursiveReasoningModel_ACTV1Carry:
-    inner_carry: TinyRecursiveReasoningModel_ACTV1InnerCarry
+class GenerativeRecursiveReasoningModelCarry:
+    inner_carry: GenerativeRecursiveReasoningModelInnerCarry
     
     steps: torch.Tensor
     halted: torch.Tensor
@@ -29,7 +29,7 @@ class TinyRecursiveReasoningModel_ACTV1Carry:
     current_data: Dict[str, torch.Tensor]
 
 
-class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
+class GenerativeRecursiveReasoningModelConfig(BaseModel):
     batch_size: int
     seq_len: int
     puzzle_emb_ndim: int = 0
@@ -170,8 +170,8 @@ class VariationalLayer(nn.Module):
         return z, mu, logvar
 
 
-class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
-    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+class GenerativeRecursiveReasoningModelBlock(nn.Module):
+    def __init__(self, config: GenerativeRecursiveReasoningModelConfig) -> None:
         super().__init__()
 
         self.config = config
@@ -211,8 +211,8 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
         return hidden_states
 
-class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
-    def __init__(self, layers: List[TinyRecursiveReasoningModel_ACTV1Block]):
+class GenerativeRecursiveReasoningModelReasoningModule(nn.Module):
+    def __init__(self, layers: List[GenerativeRecursiveReasoningModelBlock]):
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
 
@@ -223,8 +223,8 @@ class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
         return hidden_states
 
 
-class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
-    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+class GenerativeRecursiveReasoningModelInner(nn.Module):
+    def __init__(self, config: GenerativeRecursiveReasoningModelConfig) -> None:
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
@@ -275,7 +275,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             pass
 
         # Reasoning Layers
-        self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+        self.L_level = GenerativeRecursiveReasoningModelReasoningModule(layers=[GenerativeRecursiveReasoningModelBlock(self.config) for _i in range(self.config.L_layers)])
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -310,18 +310,18 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
-        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+        return GenerativeRecursiveReasoningModelInnerCarry(
             z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
             z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
         )
         
-    def reset_carry(self, reset_flag: torch.Tensor, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry):
-        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+    def reset_carry(self, reset_flag: torch.Tensor, carry: GenerativeRecursiveReasoningModelInnerCarry):
+        return GenerativeRecursiveReasoningModelInnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, carry: GenerativeRecursiveReasoningModelInnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[GenerativeRecursiveReasoningModelInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -396,10 +396,10 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # LM Outputs
         if self.config.version == 'v1':
-            new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+            new_carry = GenerativeRecursiveReasoningModelInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
         elif self.config.version in ['v2', 'v2.5', 'v3', 'v3.5']:
             z_H_conditioned = torch.cat([puzzle_emb, h_T_conditioned], dim=1)
-            new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H_conditioned.detach(), z_L=z_L.detach())
+            new_carry = GenerativeRecursiveReasoningModelInnerCarry(z_H=z_H_conditioned.detach(), z_L=z_L.detach())
         output = self.lm_head(h_T_conditioned)
         q_logits = self.q_head(puzzle_emb[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
 
@@ -412,15 +412,15 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), vae_outputs, value_pred
 
 
-class TinyRecursiveReasoningModel_ACTV1(nn.Module):
+class GenerativeRecursiveReasoningModel(nn.Module):
     """ACT wrapper."""
 
     def __init__(self, config_dict: dict):
         super().__init__()
-        self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)
-        print("Initializing TRM with config:", self.config)
+        self.config = GenerativeRecursiveReasoningModelConfig(**config_dict)
+        print("Initializing GRAM with config:", self.config)
         assert self.config.middle_latent in ["prior", "posterior", "none"], "middle_latent must be one of prior/posterior/none"
-        self.inner = TinyRecursiveReasoningModel_ACTV1_Inner(self.config)
+        self.inner = GenerativeRecursiveReasoningModelInner(self.config)
 
     @property
     def puzzle_emb(self):
@@ -429,7 +429,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
 
-        return TinyRecursiveReasoningModel_ACTV1Carry(
+        return GenerativeRecursiveReasoningModelCarry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
             
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
@@ -438,7 +438,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
         
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
+    def forward(self, carry: GenerativeRecursiveReasoningModelCarry, batch: Dict[str, torch.Tensor]) -> Tuple[GenerativeRecursiveReasoningModelCarry, Dict[str, torch.Tensor]]:
 
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
@@ -491,4 +491,4 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+        return GenerativeRecursiveReasoningModelCarry(new_inner_carry, new_steps, halted, new_current_data), outputs

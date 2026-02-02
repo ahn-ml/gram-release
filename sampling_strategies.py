@@ -5,7 +5,6 @@ import torch
 def compute_seq_correctness(inputs, labels, predictions, device, data_path=None):
     """Compute sequence-level correctness with task-specific verification.
 
-    For maze tasks: Uses BFS to verify any valid shortest path.
     For graph coloring: Uses constraint + canonical form verification.
     For other tasks: Uses exact label matching.
     """
@@ -19,21 +18,15 @@ def compute_seq_correctness(inputs, labels, predictions, device, data_path=None)
                            torch.zeros_like(loss_counts, dtype=torch.float32))
 
     # Detect task type from data_path (more reliable than vocab size)
-    is_maze = False
     is_graph_coloring = False
     is_nqueens = False
 
     if data_path is not None:
         data_path_lower = data_path.lower() if isinstance(data_path, str) else ""
         is_nqueens = 'nqueens' in data_path_lower
-        is_maze = 'maze' in data_path_lower
         is_graph_coloring = ('graph-coloring' in data_path_lower or 'graph_coloring' in data_path_lower)
 
-    if is_maze:
-        # Use BFS verification for mazes
-        from evaluators.maze_utils import batch_verify_maze
-        seq_is_correct = batch_verify_maze(inputs, predictions)
-    elif is_graph_coloring:
+    if is_graph_coloring:
         # Use constraint + canonical form verification for graph coloring
         from evaluators.graph_coloring_utils import batch_verify_coloring
         seq_is_correct = batch_verify_coloring(inputs, predictions)
@@ -94,7 +87,7 @@ def sample_parallel(model, batch, num_samples, return_keys, device, extract_h_st
         if all_finish:
             break
 
-    # Compute correctness (B*K) with maze BFS verification
+    # Compute correctness (B*K)
     labels, predictions = batch_expanded["labels"], preds["preds"]
     inputs = batch_expanded["inputs"]
     seq_is_correct, token_acc, loss_counts = compute_seq_correctness(inputs, labels, predictions, device, data_path=data_path)
@@ -289,7 +282,7 @@ def sample_with_beam_search(model, batch, num_samples, beam_size, branch_every,
                         carry.steps[dst_global] = steps.clone()
                         carry.halted[dst_global] = halted.clone()
 
-    # Compute final correctness (B*K) with maze BFS verification
+    # Compute final correctness (B*K)
     labels, predictions = batch_expanded["labels"], preds["preds"]
     inputs = batch_expanded["inputs"]
     seq_is_correct, token_acc, loss_counts = compute_seq_correctness(inputs, labels, predictions, device, data_path=data_path)

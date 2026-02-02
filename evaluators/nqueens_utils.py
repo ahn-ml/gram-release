@@ -137,7 +137,7 @@ def batch_verify_nqueens(inputs, predictions, n=None):
     """Verify batch of N-Queens predictions. Returns (B,) boolean tensor.
 
     Args:
-        inputs: Input tensor (B, N*N) - not used but kept for API consistency with maze
+        inputs: Input tensor (B, N*N) - not used but kept for API consistency
         predictions: Prediction tensor (B, N*N)
         n: Board size (inferred if None)
 
