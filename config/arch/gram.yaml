@@ -1,0 +1,52 @@
+name: recursive_reasoning.gram@GenerativeRecursiveReasoningModel
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy  # softmax_cross_entropy | stablemax_cross_entropy
+  kl_coef: ${..kl_coef}
+  kl_balance_alpha: ${..kl_balance_alpha}
+  free_bits: ${..free_bits}
+  value_coef: ${..value_coef}
+
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+H_cycles: 3
+L_cycles: 6
+
+H_layers: 0
+L_layers: 2
+
+hidden_size: 512
+num_heads: 8  # min(2, hidden_size // 64)
+expansion: 4
+
+use_mlp_lm_head: true # use MLP decoder (SwiGLU) instead of linear projection for lm_head
+
+puzzle_emb_ndim: ${.hidden_size}
+
+pos_encodings: rope
+forward_dtype: bfloat16
+
+mlp_t: False # use mlp on L instead of transformer
+puzzle_emb_len: 16 # if non-zero, its specified to this value
+no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+
+# Variational parameters
+latent_dim: 256  # dimension of latent variable z
+kl_coef: 0.1 # coefficient for KL divergence loss
+kl_balance_alpha: null # KL balancing alpha (null=disabled, 0.8=enabled with DreamerV3 setting)
+free_bits: null # free bits for KL loss (null=disabled, e.g., 0.1=minimum KL per latent dimension)
+use_mlp_sampler: true # use MLP encoders for prior/posterior (False=linear projection, True=SwiGLU MLP)
+fix_mu: False # if True, force mu = 0 for both prior and posterior (ablation)
+fix_std: False # if True, force std = 0 for both prior and posterior, deterministic (ablation)
+
+# Value head parameters
+use_value_head: False # add value head to predict current state accuracy (False=disabled, True=enabled)
+value_coef: 1.0 # coefficient for value loss (only used if use_value_head=True)
+
+# Patchify parameters (for image data like MNIST)
+use_patchify: False # Enable patchify for image inputs (False=default seq embedding, True=patch embedding)
+patch_size: 2 # Patch size for patchify (same as dit.py)
+in_channels: 1 # Number of input channels (1 for MNIST)
+image_size: 28 # Image size (28 for MNIST)
+

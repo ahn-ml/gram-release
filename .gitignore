@@ -1,0 +1,12 @@
+**/outputs/
+**/cache/
+**/__pycache__/
+**/checkpoints/
+**/data/
+**/wandb/
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.egg-info/
+.env
