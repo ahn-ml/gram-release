@@ -79,22 +79,30 @@ class GenerativeRecursiveReasoningModelConfig(BaseModel):
     # Value head parameters
     use_value_head: bool = False  # Add value head to predict current state accuracy
 
+    # Patchify parameters (for image data)
+    use_patchify: bool = False  # Enable patchify for image inputs
+    patch_size: int = 2  # Patch size (2 for MNIST)
+    in_channels: int = 1  # Number of input channels (1 for MNIST)
+    image_size: int = 28  # Image size (28 for MNIST)
+
 
 class VariationalLayer(nn.Module):
     """Variational layer with optional MLP encoders"""
     def __init__(self, hidden_size: int, latent_dim: int, vocab_size: int, use_mlp: bool = False, expansion: float = 2.0,
-                 fix_mu: bool = False, fix_std: bool = False):
+                 fix_mu: bool = False, fix_std: bool = False, posterior_y_dim: int = None):
         super().__init__()
         self.use_mlp = use_mlp
         self.fix_mu = fix_mu
         self.fix_std = fix_std
+        # posterior_y_dim: dimension of y input for posterior (default: vocab_size, or hidden_size for patchify)
+        self.posterior_y_dim = posterior_y_dim if posterior_y_dim is not None else vocab_size
 
         if use_mlp:
             # Prior: p(z|x) - MLP encoder outputs 2*latent_dim (mu and logvar)
             self.prior_mlp = SwiGLU(hidden_size, expansion, out_dim=2 * latent_dim)
 
             # Posterior: q(z|x, y) - MLP encoder outputs 2*latent_dim (mu and logvar)
-            self.post_mlp = SwiGLU(hidden_size + vocab_size, expansion, out_dim=2 * latent_dim)
+            self.post_mlp = SwiGLU(hidden_size + self.posterior_y_dim, expansion, out_dim=2 * latent_dim)
 
             # Project z back to hidden_size
             self.z_proj = nn.Linear(latent_dim, hidden_size)
@@ -104,8 +112,8 @@ class VariationalLayer(nn.Module):
             self.prior_logvar = nn.Linear(hidden_size, latent_dim)
 
             # Posterior: q(z|x, y) - Linear projection
-            self.post_mu = nn.Linear(hidden_size + vocab_size, latent_dim)
-            self.post_logvar = nn.Linear(hidden_size + vocab_size, latent_dim)
+            self.post_mu = nn.Linear(hidden_size + self.posterior_y_dim, latent_dim)
+            self.post_logvar = nn.Linear(hidden_size + self.posterior_y_dim, latent_dim)
 
             # Project z back to hidden_size
             self.z_proj = nn.Linear(latent_dim, hidden_size)
@@ -177,8 +185,9 @@ class GenerativeRecursiveReasoningModelBlock(nn.Module):
         self.config = config
         if self.config.mlp_t:
             self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+            effective_seq_len = (self.config.image_size // self.config.patch_size) ** 2 if self.config.use_patchify else self.config.seq_len
             self.mlp_t = SwiGLU(
-                hidden_size=self.config.seq_len + self.puzzle_emb_len, # L
+                hidden_size=effective_seq_len + self.puzzle_emb_len,
                 expansion=config.expansion,
             )
         else:
@@ -248,14 +257,34 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
         if self.config.use_value_head:
             self.value_head = CastedLinear(self.config.hidden_size, 1, bias=True)
 
+        # Patchify layers (for image data, following dit.py)
+        if self.config.use_patchify:
+            p, c, h = self.config.patch_size, self.config.in_channels, self.config.hidden_size
+            self.init_conv_seq = nn.Sequential(
+                nn.Conv2d(c, h // 2, kernel_size=5, padding=2, stride=1),
+                nn.SiLU(),
+                nn.GroupNorm(32, h // 2),
+                nn.Conv2d(h // 2, h // 2, kernel_size=5, padding=2, stride=1),
+                nn.SiLU(),
+                nn.GroupNorm(32, h // 2),
+            )
+            self.patch_embedder = nn.Linear(p * p * h // 2, h, bias=True)
+            nn.init.constant_(self.patch_embedder.bias, 0)
+            # For output: project back to patch logits
+            self.patch_out = nn.Linear(h, p * p * c * self.config.vocab_size, bias=True)
+            # Compute patched seq_len for position embeddings
+            self.num_patches = (self.config.image_size // p) ** 2
+
         # Variational layer
+        posterior_y_dim = self.config.hidden_size if self.config.use_patchify else self.config.vocab_size
         self.variational = VariationalLayer(
             self.config.hidden_size,
             self.config.latent_dim,
             self.config.vocab_size,
             use_mlp=self.config.use_mlp_sampler,
             fix_mu=self.config.fix_mu,
-            fix_std=self.config.fix_std
+            fix_std=self.config.fix_std,
+            posterior_y_dim=posterior_y_dim
         )
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
@@ -264,13 +293,16 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
             self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
                                                     batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype)
 
+        # Compute effective seq_len for position embeddings (patchified or original)
+        effective_seq_len = self.num_patches if self.config.use_patchify else self.config.seq_len
+
         # LM Blocks
         if self.config.pos_encodings == "rope":
             self.rotary_emb = RotaryEmbedding(dim=self.config.hidden_size // self.config.num_heads,
-                                              max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
+                                              max_position_embeddings=effective_seq_len + self.puzzle_emb_len,
                                               base=self.config.rope_theta)
         elif self.config.pos_encodings == "learned":
-            self.embed_pos = CastedEmbedding(self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+            self.embed_pos = CastedEmbedding(effective_seq_len + self.puzzle_emb_len, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         else:
             pass
 
@@ -287,9 +319,43 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
 
+    def _patchify(self, x: torch.Tensor) -> torch.Tensor:
+        """Patchify image: (B, C, H, W) -> (B, num_patches, patch_size*patch_size*C)"""
+        B, C, H, W = x.size()
+        p = self.config.patch_size
+        x = x.view(B, C, H // p, p, W // p, p)
+        x = x.permute(0, 2, 4, 1, 3, 5).flatten(-3).flatten(1, 2)
+        return x  # (B, num_patches, p*p*C)
+
+    def _unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        """Unpatchify: (B, num_patches, p*p*C*vocab) -> (B, C, H, W, vocab)"""
+        p = self.config.patch_size
+        c = self.config.in_channels
+        v = self.config.vocab_size
+        h = w = self.config.image_size // p
+        x = x.reshape(x.shape[0], h, w, p, p, c, v)
+        x = x.permute(0, 5, 1, 3, 2, 4, 6)  # (B, C, h, p, w, p, vocab)
+        x = x.reshape(x.shape[0], c, h * p, w * p, v)  # (B, C, H, W, vocab)
+        return x
+
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
-        # Token embedding
-        embedding = self.embed_tokens(input.to(torch.int32))
+        # Patchify branch for image data
+        if self.config.use_patchify:
+            B = input.shape[0]
+            c, s = self.config.in_channels, self.config.image_size
+            # Reshape flat input to image: (B, seq) -> (B, C, H, W)
+            # Convert token values (1 to vocab_size-1) to pixel values (0 to vocab_size-2)
+            x_img = (input - 1).view(B, c, s, s).float()
+            # Normalize to [-1, 1] and apply conv (vocab_size-2 = num_levels - 1)
+            num_levels = self.config.vocab_size - 1  # Exclude PAD token
+            x_img = (2 * x_img / max(num_levels - 1, 1)) - 1.0
+            x_conv = self.init_conv_seq(x_img)  # (B, h//2, H, W)
+            # Patchify and embed
+            x_patch = self._patchify(x_conv)  # (B, num_patches, p*p*h//2)
+            embedding = self.patch_embedder(x_patch)  # (B, num_patches, hidden_size)
+        else:
+            # Token embedding
+            embedding = self.embed_tokens(input.to(torch.int32))
 
         # Puzzle embeddings
         if self.config.puzzle_emb_ndim > 0:
@@ -309,10 +375,34 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
         # Scale
         return self.embed_scale * embedding
 
+    def _get_label_embedding(self, labels: torch.Tensor) -> torch.Tensor:
+        """Get label embedding for posterior in patchify mode.
+        
+        Args:
+            labels: (B, seq_len) flat labels
+        Returns:
+            (B, num_patches, hidden_size) patch embeddings of labels
+        """
+        B = labels.shape[0]
+        c, s = self.config.in_channels, self.config.image_size
+        # Reshape flat labels to image: (B, seq) -> (B, C, H, W)
+        # Convert token values (1 to vocab_size-1) to pixel values (0 to vocab_size-2)
+        y_img = (labels - 1).view(B, c, s, s).float()
+        # Normalize to [-1, 1] and apply conv (same as input)
+        num_levels = self.config.vocab_size - 1  # Exclude PAD token
+        y_img = (2 * y_img / max(num_levels - 1, 1)) - 1.0
+        y_conv = self.init_conv_seq(y_img)  # (B, h//2, H, W)
+        # Patchify and embed
+        y_patch = self._patchify(y_conv)  # (B, num_patches, p*p*h//2)
+        y_emb = self.patch_embedder(y_patch)  # (B, num_patches, hidden_size)
+        # Detach to prevent gradient flow through input encoder when processing posterior labels
+        return y_emb.to(self.forward_dtype)
+
     def empty_carry(self, batch_size: int):
+        seq_len = self.num_patches if self.config.use_patchify else self.config.seq_len
         return GenerativeRecursiveReasoningModelInnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(batch_size, seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L=torch.empty(batch_size, seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: GenerativeRecursiveReasoningModelInnerCarry):
@@ -346,7 +436,10 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
                     sample_in = (h_t + l_t) if self.config.version in ['v3', 'v3.5'] else h_t
 
                     if self.training and (self.config.middle_latent == "posterior"):
-                        y_tar = F.one_hot(batch["labels"].long(), num_classes=self.config.vocab_size).to(torch.float32)
+                        if self.config.use_patchify:
+                            y_tar = self._get_label_embedding(batch["labels"])
+                        else:
+                            y_tar = F.one_hot(batch["labels"].long(), num_classes=self.config.vocab_size).to(torch.float32)
                         z_post, post_mu, post_logvar = self.variational.sample_posterior(sample_in, y_tar)
                         z = z_post
                     else:
@@ -379,7 +472,10 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
 
         if self.training:
             # Sample from posterior q(z|h_T, y_tar)
-            y_tar = F.one_hot(batch["labels"].long(), num_classes=self.config.vocab_size).to(torch.float32)
+            if self.config.use_patchify:
+                y_tar = self._get_label_embedding(batch["labels"])
+            else:
+                y_tar = F.one_hot(batch["labels"].long(), num_classes=self.config.vocab_size).to(torch.float32)
             z_post, post_mu, post_logvar = self.variational.sample_posterior(sample_in, y_tar)
             vae_outputs['post_mu'] = post_mu
             vae_outputs['post_logvar'] = post_logvar
@@ -400,7 +496,15 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
         elif self.config.version in ['v2', 'v2.5', 'v3', 'v3.5']:
             z_H_conditioned = torch.cat([puzzle_emb, h_T_conditioned], dim=1)
             new_carry = GenerativeRecursiveReasoningModelInnerCarry(z_H=z_H_conditioned.detach(), z_L=z_L.detach())
-        output = self.lm_head(h_T_conditioned)
+        
+        # Output projection
+        if self.config.use_patchify:
+            # (B, num_patches, hidden) -> (B, num_patches, p*p*C*vocab) -> (B, C, H, W, vocab) -> (B, seq, vocab)
+            patch_logits = self.patch_out(h_T_conditioned)
+            img_logits = self._unpatchify(patch_logits)  # (B, C, H, W, vocab)
+            output = img_logits.reshape(img_logits.shape[0], -1, self.config.vocab_size)  # (B, seq, vocab)
+        else:
+            output = self.lm_head(h_T_conditioned)
         q_logits = self.q_head(puzzle_emb[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
 
         # Value head (optional): predict current state accuracy from mean-pooled h_T

@@ -46,3 +46,9 @@ fix_std: False # if True, force std = 0 for both prior and posterior, determinis
 use_value_head: False # add value head to predict current state accuracy (False=disabled, True=enabled)
 value_coef: 1.0 # coefficient for value loss (only used if use_value_head=True)
 
+# Patchify parameters (for image data like MNIST)
+use_patchify: False # Enable patchify for image inputs (False=default seq embedding, True=patch embedding)
+patch_size: 2 # Patch size for patchify (same as dit.py)
+in_channels: 1 # Number of input channels (1 for MNIST)
+image_size: 28 # Image size (28 for MNIST)
+

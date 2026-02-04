@@ -44,13 +44,13 @@ python -m dataset.build_arc_dataset \
 python dataset/build_sudoku_dataset.py --output-dir data/sudoku-extreme-1k-aug-1000  --subsample-size 1000 --num-aug 1000  # 1000 examples, 1000 augments
 
 # N-Queens
-# TBD
+python dataset/build_nqueens_dataset.py --n 8 --remove-counts 5 6 7 --output-dir data/nqueens-8
 
 # Graph Coloring
 # TBD
 
 # MNIST
-# TBD
+python dataset/build_mnist_dataset.py --output-dir data/mnist_2 --vocab-levels 2 --test-vocab-levels 256 --threshold 0.5
 ```
 
 ## Experiments
@@ -103,14 +103,61 @@ arch.H_cycles=3 arch.L_cycles=6 \
 
 *Runtime:* < 36 hours
 
-### N-Queens
-TBD
+### N-Queens (assuming 8 RTX 4090 GPUs):
+
+```bash
+run_name="pretrain_att_nqueens_8"
+torchrun --nproc-per-node 8 --rdzv_backend=c10d --rdzv_endpoint=localhost:0 --nnodes=1 pretrain.py \
+arch=gram \
+seed=42 \
+global_batch_size=768 \
+data_paths="[data/nqueens-8]" \
+evaluators="[]" \
+epochs=5000 eval_interval=50 \
+lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 \
+arch.L_layers=2 \
+arch.H_cycles=3 arch.L_cycles=4 arch.version=v2 \
+arch.middle_latent=posterior \
+arch.use_mlp_sampler=True \
+arch.use_mlp_lm_head=True \
+arch.kl_balance_alpha=0.8 \
+arch.kl_coef=0.07 \
++run_name=${run_name} ema=True \
+checkpoint_every_eval=True
+```
+
+*Runtime:* ~1 hours
+
 
 ### Graph Coloring
 TBD
 
-### MNIST
-TBD
+### MNIST (assuming 8 RTX 4090 GPUs):
+```bash
+run_name="pretrain_att_mnist_2"
+torchrun --nproc-per-node 8 --rdzv_backend=c10d --rdzv_endpoint=localhost:0 --nnodes=1 pretrain.py \
+arch=gram \
+seed=42 \
+global_batch_size=768 \
+data_paths="[data/mnist_2]" \
+evaluators="[]" \
+epochs=1800 eval_interval=5 \
+lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 \
+arch.L_layers=2 \
+arch.H_cycles=3 arch.L_cycles=4 arch.version=v2 \
+arch.middle_latent=posterior \
+arch.use_mlp_sampler=True \
+arch.use_mlp_lm_head=True \
+arch.kl_balance_alpha=0.8 \
+arch.kl_coef=0.015 \
+arch.use_patchify=True \
+arch.patch_size=2 \
+arch.image_size=28 \
+arch.in_channels=1 \
++run_name=${run_name} ema=True \
+checkpoint_every_eval=True
+```
+*Runtime:* ~12 hours
 
 
 ## Reference

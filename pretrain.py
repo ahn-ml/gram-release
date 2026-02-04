@@ -9,8 +9,11 @@ import random
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch import nn
+from torchmetrics.image.inception import InceptionScore
+from torchmetrics.image.fid import FrechetInceptionDistance
 from torch.utils.data import DataLoader
 
 import tqdm
@@ -381,6 +384,54 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics["train/lr"] = lr_this_step
             return reduced_metrics
 
+def detect_image_task(data_paths: List[str]) -> tuple:
+    """Detect image generation task type and return (task_name, img_size, channels)."""
+    for p in data_paths:
+        if "mnist" in p.lower():
+            return ("mnist", 28, 1)
+    return (None, 0, 0)
+
+
+def tokens_to_pixels(tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Convert tokens to pixel values [0, 255] based on vocab_size.
+    
+    Token encoding: PAD=0, pixel values -> tokens 1 to vocab_size-1
+    For vocab_size=257: standard 0-255 range
+    For vocab_size=3: binary (0 or 255)
+    For vocab_size=17: 16 levels scaled to 0-255
+    """
+    num_levels = vocab_size - 1  # Exclude PAD token
+    if num_levels == 256:
+        return (tokens.float() - 1).clamp(0, 255)
+    else:
+        return ((tokens.float() - 1) / max(num_levels - 1, 1) * 255).clamp(0, 255)
+
+
+def log_image_samples(samples: list, task: str, img_size: int, channels: int, step: int, 
+                      label_vocab_size: int = 257, pred_vocab_size: int = 257):
+    """Log image samples to wandb. Supports grayscale (C=1) and RGB (C=3).
+    
+    Args:
+        label_vocab_size: vocab_size for ground truth labels (eval vocab)
+        pred_vocab_size: vocab_size for model predictions (train vocab)
+    """
+    if not samples or wandb.run is None:
+        return
+    images = []
+    for label, pred in samples:
+        label_arr = tokens_to_pixels(label, label_vocab_size).numpy().astype(np.uint8)
+        pred_arr = tokens_to_pixels(pred, pred_vocab_size).numpy().astype(np.uint8)
+        if channels == 1:
+            label_img = label_arr.reshape(img_size, img_size)
+            pred_img = pred_arr.reshape(img_size, img_size)
+        else:  # RGB: (C, H, W) → (H, W, C)
+            label_img = label_arr.reshape(channels, img_size, img_size).transpose(1, 2, 0)
+            pred_img = pred_arr.reshape(channels, img_size, img_size).transpose(1, 2, 0)
+        combined = np.concatenate([label_img, pred_img], axis=1)
+        images.append(wandb.Image(combined, caption="Label | Pred"))
+    wandb.log({f"eval/{task}_samples": images}, step=step)
+
+
 def evaluate(
     config: PretrainConfig,
     train_state: TrainState,
@@ -390,14 +441,29 @@ def evaluate(
     rank: int,
     world_size: int,
     cpu_group: Optional[dist.ProcessGroup],
+    fid_metric: Optional[FrechetInceptionDistance] = None,
+    is_metric: Optional[InceptionScore] = None,
+    train_vocab_size: Optional[int] = None,  # vocab_size used for model predictions
 ):
     reduced_metrics = None
+    
+    # Image generation task detection
+    img_task, img_size, img_channels = detect_image_task(config.data_paths)
+    img_samples = []
+    
+    # Use train_vocab_size for predictions, eval_metadata.vocab_size for labels
+    pred_vocab_size = train_vocab_size if train_vocab_size is not None else eval_metadata.vocab_size
+    label_vocab_size = eval_metadata.vocab_size
 
     with torch.inference_mode():
         return_keys = set(config.eval_save_outputs)
         for evaluator in evaluators:
             evaluator.begin_eval()
             return_keys.update(evaluator.required_outputs)
+        
+        # Add preds for image visualization
+        if img_task:
+            return_keys.add("preds")
 
         # Run evaluation
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
@@ -417,6 +483,22 @@ def evaluate(
 
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
+            
+            # Keep original labels for visualization (in eval vocab range)
+            original_labels = batch["labels"].clone() if img_task else None
+            
+            # Scale tokens from eval vocab to train vocab range for model
+            # Token encoding: PAD=0, pixels -> 1 to vocab_size-1
+            if pred_vocab_size != label_vocab_size:
+                eval_levels = label_vocab_size - 1  # e.g., 256
+                train_levels = pred_vocab_size - 1   # e.g., 16
+                # Scale: (token-1) / (eval_levels-1) * (train_levels-1) + 1
+                for key in ["inputs", "labels"]:
+                    if key in batch:
+                        tokens = batch[key].float()
+                        scaled = ((tokens - 1) / max(eval_levels - 1, 1) * (train_levels - 1) + 1).round().long()
+                        batch[key] = scaled.clamp(0, pred_vocab_size - 1)
+            
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
@@ -433,6 +515,25 @@ def evaluate(
 
             if rank == 0:
                 print(f"  Completed inference in {inference_steps} steps")
+
+            # Collect image samples for visualization (rank 0 only, max 10)
+            # Use original_labels (high-res) for ground truth visualization
+            if img_task and rank == 0 and len(img_samples) < 10:
+                n = min(10 - len(img_samples), batch["inputs"].shape[0])
+                labels_for_vis = original_labels if original_labels is not None else batch["labels"]
+                for i in range(n):
+                    img_samples.append((labels_for_vis[i].cpu(), preds["preds"][i].cpu()))
+            
+            # Update FID/IS metrics (fake samples only, real precomputed in launch)
+            if img_task and fid_metric is not None:
+                predictions = preds["preds"]
+                # Use pred_vocab_size for model predictions (train vocab)
+                fake_imgs = tokens_to_pixels(predictions, pred_vocab_size).view(-1, img_channels, img_size, img_size)
+                if img_channels == 1:
+                    fake_imgs = fake_imgs.repeat(1, 3, 1, 1)
+                fake_imgs = F.interpolate(fake_imgs, size=(299, 299), mode="bilinear", align_corners=False).to(torch.uint8)
+                fid_metric.update(fake_imgs, real=False)
+                is_metric.update(fake_imgs)
 
             for collection in (batch, preds):
                 for k, v in collection.items():
@@ -521,6 +622,28 @@ def evaluate(
                 
         if rank == 0:
             print("All evaluators completed!")
+            
+        # Log image samples to wandb
+        if img_task and rank == 0:
+            log_image_samples(img_samples, img_task, img_size, img_channels, train_state.step, 
+                              label_vocab_size, pred_vocab_size)
+
+        # Compute FID and IS for image tasks
+        if img_task and fid_metric is not None:
+            if world_size > 1:
+                dist.barrier()
+            fid_value = fid_metric.compute().item()
+            is_mean, is_std = is_metric.compute()
+            if rank == 0:
+                print(f"FID: {fid_value:.2f}, IS: {is_mean:.2f} ± {is_std:.2f}")
+                if reduced_metrics is None:
+                    reduced_metrics = {}
+                reduced_metrics["val/fid"] = fid_value
+                reduced_metrics["val/is_mean"] = is_mean.item()
+                reduced_metrics["val/is_std"] = is_std.item()
+            # Reset only fake features for next eval (real features are cached)
+            fid_metric.reset()
+            is_metric.reset()
 
     return reduced_metrics
 
@@ -634,7 +757,7 @@ def launch(hydra_config: DictConfig):
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
         wandb_mode = "offline" if config.wandb_offline else "online"
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True), mode=wandb_mode)  # type: ignore
+        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=False), mode=wandb_mode)  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
     if config.ema:
@@ -648,6 +771,29 @@ def launch(hydra_config: DictConfig):
             if 'ema' in checkpoint:
                 print('  ✓ Loading EMA state from checkpoint')
                 ema_helper.load_state_dict(checkpoint['ema'])
+    
+    # Setup FID/IS metrics for image tasks (once, with real samples precomputed)
+    fid_metric, is_metric = None, None
+    img_task, img_size, img_channels = detect_image_task(config.data_paths)
+    if img_task and eval_loader is not None:
+        print(f"Setting up FID/IS metrics for {img_task}...")
+        fid_metric = FrechetInceptionDistance(
+            feature=2048, normalize=False, reset_real_features=False
+        ).to("cuda")
+        is_metric = InceptionScore(
+            feature="logits_unbiased", splits=10, normalize=False
+        ).to("cuda")
+        # Precompute real image statistics from eval set
+        with torch.inference_mode():
+            for set_name, batch, _ in eval_loader:
+                labels = batch["labels"].cuda()
+                real_imgs = tokens_to_pixels(labels, eval_metadata.vocab_size).view(-1, img_channels, img_size, img_size)
+                if img_channels == 1:
+                    real_imgs = real_imgs.repeat(1, 3, 1, 1)
+                real_imgs = F.interpolate(real_imgs, size=(299, 299), mode="bilinear", align_corners=False).to(torch.uint8)
+                fid_metric.update(real_imgs, real=True)
+        if RANK == 0:
+            print(f"  ✓ Real image statistics precomputed")
 
     # Training Loop
     for _iter_id in range(total_iters):
@@ -684,7 +830,10 @@ def launch(hydra_config: DictConfig):
                 evaluators,
                 rank=RANK, 
                 world_size=WORLD_SIZE,
-                cpu_group=CPU_PROCESS_GROUP)
+                cpu_group=CPU_PROCESS_GROUP,
+                fid_metric=fid_metric,
+                is_metric=is_metric,
+                train_vocab_size=train_metadata.vocab_size)
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
