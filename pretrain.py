@@ -316,15 +316,12 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
         for data_path in data_paths:
             cls = load_model_class(cfg.name, "evaluators.")(
                 data_path=data_path, eval_metadata=eval_metadata, **cfg.__pydantic_extra__
-            )  # type: ignore
-            # Set vocab size and precompute features if evaluator supports it
-            if hasattr(cls, 'set_train_vocab_size') and train_vocab_size is not None:
+            )
+            if train_vocab_size is not None:
                 cls.set_train_vocab_size(train_vocab_size)
-            if hasattr(cls, 'precompute_real_features') and eval_loader is not None:
+            if eval_loader is not None:
                 cls.precompute_real_features(eval_loader, device=torch.device("cuda"))
-            
             evaluators.append(cls)
-
     return evaluators
 
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
@@ -400,9 +397,6 @@ def evaluate(
     cpu_group: Optional[dist.ProcessGroup],
 ):
     reduced_metrics = None
-    
-    # Find evaluator that handles batch scaling (e.g., MNIST)
-    scaling_evaluator = next((e for e in evaluators if hasattr(e, 'scale_batch')), None)
 
     with torch.inference_mode():
         return_keys = set(config.eval_save_outputs)
@@ -424,10 +418,10 @@ def evaluate(
 
             batch = {k: v.cuda() for k, v in batch.items()}
             
-            # Let evaluator handle vocab scaling if needed
+            # Let first evaluator handle vocab scaling if needed
             original_labels = None
-            if scaling_evaluator is not None:
-                batch, original_labels = scaling_evaluator.scale_batch(batch)
+            if evaluators:
+                batch, original_labels = evaluators[0].scale_batch(batch)
             
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
@@ -451,11 +445,7 @@ def evaluate(
                         save_preds[k].append(v.cpu())  # Move to CPU for saving GPU memory
 
             for evaluator in evaluators:
-                if hasattr(evaluator, 'update_batch'):
-                    if hasattr(evaluator, 'scale_batch'):
-                        evaluator.update_batch(batch, preds, original_labels=original_labels)
-                    else:
-                        evaluator.update_batch(batch, preds)
+                evaluator.update_batch(batch, preds, original_labels=original_labels)
 
             del carry, loss, preds, batch, all_finish
 
@@ -698,8 +688,7 @@ def launch(hydra_config: DictConfig):
             train_state_eval.model.eval()
             # Set step for evaluator logging
             for evaluator in evaluators:
-                if hasattr(evaluator, 'set_step'):
-                    evaluator.set_step(train_state.step)
+                evaluator.set_step(train_state.step)
             
             metrics = evaluate(config, 
                 train_state_eval, 

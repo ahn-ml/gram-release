@@ -66,7 +66,13 @@ class ARC:
             self._local_hmap = {}
             self._local_preds = {}
     
-    def update_batch(self, batch: Dict[str, torch.Tensor], preds: Dict[str, torch.Tensor]):
+    # Interface compatibility with image evaluators
+    def set_train_vocab_size(self, vocab_size: int): pass
+    def set_step(self, step: int): pass
+    def scale_batch(self, batch): return batch, None
+    def precompute_real_features(self, eval_loader, device): pass
+    
+    def update_batch(self, batch: Dict[str, torch.Tensor], preds: Dict[str, torch.Tensor], original_labels: Optional[torch.Tensor] = None):
         # Collect required outputs to CPU
         outputs = {}
         q_values = None
