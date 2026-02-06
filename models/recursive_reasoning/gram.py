@@ -2,11 +2,9 @@ from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math
 import torch
-import copy
 import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
-import random
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
@@ -66,8 +64,6 @@ class GenerativeRecursiveReasoningModelConfig(BaseModel):
     latent_dim: int = 256
     kl_coef: float = 0.1
     use_mlp_sampler: bool = False  # Use MLP for prior/posterior instead of linear projection
-    version: str = "v1"  # version of variational TRM (v1 or v2 ...)
-    middle_latent: str = "prior"
 
     # Variational sampling control (for ablation)
     fix_mu: bool = False  # If True, force mu = 0 (both prior and posterior)
@@ -330,7 +326,6 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         # Forward iterations
-        it = 0
         z_H, z_L = carry.z_H, carry.z_L
         # H_cycles-1 without grad
         with torch.no_grad():
@@ -339,26 +334,22 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
 
-                if self.config.version in ['v2', 'v2.5', 'v3', 'v3.5'] and self.config.middle_latent in ["prior", "posterior"]: # variational in the middle of cycles
-                    puzzle_emb = z_H[:, :self.puzzle_emb_len]
-                    h_t = z_H[:, self.puzzle_emb_len:]
-                    l_t = z_L[:, self.puzzle_emb_len:]
-                    sample_in = (h_t + l_t) if self.config.version in ['v3', 'v3.5'] else h_t
+                # Variational in the middle of cycles (posterior during training, prior during eval)
+                puzzle_emb = z_H[:, :self.puzzle_emb_len]
+                h_t = z_H[:, self.puzzle_emb_len:]
 
-                    if self.training and (self.config.middle_latent == "posterior"):
-                        y_tar = F.one_hot(batch["labels"].long(), num_classes=self.config.vocab_size).to(torch.float32)
-                        z_post, post_mu, post_logvar = self.variational.sample_posterior(sample_in, y_tar)
-                        z = z_post
-                    else:
-                        z_pred, prior_mu, prior_logvar = self.variational.sample_prior(sample_in)
-                        z = z_pred
-                    # Decode: condition h_T on z (per-token z)
-                    B, N, _ = z.shape
-                    z_flat = z.reshape(B * N, -1)  # (B*N, latent_dim)
-                    z_proj_flat = self.variational.z_proj(z_flat)  # (B*N, hidden_size)
-                    z = z_proj_flat.reshape(B, N, -1).to(self.forward_dtype)  # (B, N, D)
-                    h_t_conditioned = z if self.config.version in ['v2.5', 'v3.5'] else h_t + z
-                    z_H = torch.cat([puzzle_emb, h_t_conditioned], dim=1)
+                if self.training:
+                    y_tar = F.one_hot(batch["labels"].long(), num_classes=self.config.vocab_size).to(torch.float32)
+                    z, _, _ = self.variational.sample_posterior(h_t, y_tar)
+                else:
+                    z, _, _ = self.variational.sample_prior(h_t)
+                # Decode: condition h_t on z (per-token z)
+                B, N, _ = z.shape
+                z_flat = z.reshape(B * N, -1)  # (B*N, latent_dim)
+                z_proj_flat = self.variational.z_proj(z_flat)  # (B*N, hidden_size)
+                z = z_proj_flat.reshape(B, N, -1).to(self.forward_dtype)  # (B, N, D)
+                h_t_conditioned = h_t + z
+                z_H = torch.cat([puzzle_emb, h_t_conditioned], dim=1)
 
         # 1 with grad
         for _L_step in range(self.config.L_cycles):
@@ -366,11 +357,9 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
         z_H = self.L_level(z_H, z_L, **seq_info)
 
         
-        # to match pseudocode
         puzzle_emb = z_H[:, :self.puzzle_emb_len]
         h_T = z_H[:, self.puzzle_emb_len:]
-        l_T = z_L[:, self.puzzle_emb_len:]
-        sample_in = (h_T + l_T) if self.config.version in ['v3', 'v3.5'] else h_T
+        sample_in = h_T
         # Variational sampling
         vae_outputs = {}
         z_pred, prior_mu, prior_logvar = self.variational.sample_prior(sample_in)
@@ -392,14 +381,11 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
         z_flat = z.reshape(B * N, -1)  # (B*N, latent_dim)
         z_proj_flat = self.variational.z_proj(z_flat)  # (B*N, hidden_size)
         z = z_proj_flat.reshape(B, N, -1).to(self.forward_dtype)  # (B, N, D)
-        h_T_conditioned = z if self.config.version == 'v3.5' else h_T + z  # (B, N, D)
+        h_T_conditioned = h_T + z  # (B, N, D)
 
         # LM Outputs
-        if self.config.version == 'v1':
-            new_carry = GenerativeRecursiveReasoningModelInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
-        elif self.config.version in ['v2', 'v2.5', 'v3', 'v3.5']:
-            z_H_conditioned = torch.cat([puzzle_emb, h_T_conditioned], dim=1)
-            new_carry = GenerativeRecursiveReasoningModelInnerCarry(z_H=z_H_conditioned.detach(), z_L=z_L.detach())
+        z_H_conditioned = torch.cat([puzzle_emb, h_T_conditioned], dim=1)
+        new_carry = GenerativeRecursiveReasoningModelInnerCarry(z_H=z_H_conditioned.detach(), z_L=z_L.detach())
         output = self.lm_head(h_T_conditioned)
         q_logits = self.q_head(puzzle_emb[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
 
@@ -419,7 +405,6 @@ class GenerativeRecursiveReasoningModel(nn.Module):
         super().__init__()
         self.config = GenerativeRecursiveReasoningModelConfig(**config_dict)
         print("Initializing GRAM with config:", self.config)
-        assert self.config.middle_latent in ["prior", "posterior", "none"], "middle_latent must be one of prior/posterior/none"
         self.inner = GenerativeRecursiveReasoningModelInner(self.config)
 
     @property

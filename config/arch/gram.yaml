@@ -37,8 +37,6 @@ kl_coef: 0.1 # coefficient for KL divergence loss
 kl_balance_alpha: null # KL balancing alpha (null=disabled, 0.8=enabled with DreamerV3 setting)
 free_bits: null # free bits for KL loss (null=disabled, e.g., 0.1=minimum KL per latent dimension)
 use_mlp_sampler: False # use MLP encoders for prior/posterior (False=linear projection, True=SwiGLU MLP)
-version: v1 # version of variational TRM (v1 or v2 ...)
-middle_latent: prior # which latent to use in the middle layers (prior/posterior/none)
 fix_mu: False # if True, force mu = 0 for both prior and posterior (ablation)
 fix_std: False # if True, force std = 0 for both prior and posterior, deterministic (ablation)
 
