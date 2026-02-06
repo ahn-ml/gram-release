@@ -6,7 +6,10 @@ This is official codebase for the paper: "Generative Recursive reAsoning Models"
 We introduce Generative Recursive reAsoning Models (GRAM), a recursion-based generative model that is effective for complex planning and reasoning problems. GRAM reformulates recent latent recursive architectures as a stochastic generative process with probabilistic latent transitions, enabling efficient and stable computation entirely in latent space without relying on token-level sequences as in chain-of-thought (CoT) prompting. We optimize this generative recursion via amortized variational inference, allowing the model to represent and explore multiple plausible latent trajectories conditioned on the input. This formulation supports both conditional reasoning through p(y|x) and unconditional generative modeling through p(x). Empirically, GRAM achieves strong performance on challenging reasoning benchmarks, competitive with much larger language models on ARC-1 and ARC-2, demonstrating the effectiveness of recursion-based generative modeling for System 2 tasks.
 
 ## Overview
-TBD
+<div align="center">
+<img src="misc/overview.png" height="400px" alt="GRAM Overview">
+</div>
+
 
 ### Requirements
 

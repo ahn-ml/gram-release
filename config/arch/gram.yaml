@@ -20,7 +20,7 @@ hidden_size: 512
 num_heads: 8  # min(2, hidden_size // 64)
 expansion: 4
 
-use_mlp_lm_head: False # use MLP decoder (SwiGLU) instead of linear projection for lm_head
+use_mlp_lm_head: true # use MLP decoder (SwiGLU) instead of linear projection for lm_head
 
 puzzle_emb_ndim: ${.hidden_size}
 
@@ -36,7 +36,7 @@ latent_dim: 256  # dimension of latent variable z
 kl_coef: 0.1 # coefficient for KL divergence loss
 kl_balance_alpha: null # KL balancing alpha (null=disabled, 0.8=enabled with DreamerV3 setting)
 free_bits: null # free bits for KL loss (null=disabled, e.g., 0.1=minimum KL per latent dimension)
-use_mlp_sampler: False # use MLP encoders for prior/posterior (False=linear projection, True=SwiGLU MLP)
+use_mlp_sampler: true # use MLP encoders for prior/posterior (False=linear projection, True=SwiGLU MLP)
 fix_mu: False # if True, force mu = 0 for both prior and posterior (ablation)
 fix_std: False # if True, force std = 0 for both prior and posterior, deterministic (ablation)
 
