@@ -116,8 +116,7 @@ evaluators="[]" \
 epochs=5000 eval_interval=50 \
 lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 \
 arch.L_layers=2 \
-arch.H_cycles=3 arch.L_cycles=4 arch.version=v2 \
-arch.middle_latent=posterior \
+arch.H_cycles=3 arch.L_cycles=4 \
 arch.use_mlp_sampler=True \
 arch.use_mlp_lm_head=True \
 arch.kl_balance_alpha=0.8 \
@@ -140,12 +139,11 @@ arch=gram \
 seed=42 \
 global_batch_size=768 \
 data_paths="[data/mnist_2]" \
-evaluators="[]" \
+evaluators='[{name: "mnist@MNIST", pred_vocab_size: 3}]' \
 epochs=1800 eval_interval=5 \
 lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 \
 arch.L_layers=2 \
-arch.H_cycles=3 arch.L_cycles=4 arch.version=v2 \
-arch.middle_latent=posterior \
+arch.H_cycles=3 arch.L_cycles=4 \
 arch.use_mlp_sampler=True \
 arch.use_mlp_lm_head=True \
 arch.kl_balance_alpha=0.8 \
