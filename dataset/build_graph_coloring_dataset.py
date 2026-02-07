@@ -32,7 +32,7 @@ cli = ArgParser()
 
 
 class DataProcessConfig(BaseModel):
-    source_repo: str = "ahn-ml/graph-coloring"
+    source_repo: str = "CUN-bjy/graph-coloring"
     config_name: str = "graph-coloring-8"  # "graph-coloring-8" or "graph-coloring-10"
     output_dir: str = "data/graph-coloring-8"
     num_colors: int = 3
