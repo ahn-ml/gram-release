@@ -93,6 +93,8 @@ def sample_parallel(model, batch, num_samples, return_keys, device, extract_h_st
     seq_is_correct, token_acc, loss_counts = compute_seq_correctness(inputs, labels, predictions, device, data_path=data_path)
 
     # Extract h_states if needed (B*K, hidden_dim)
+    # Note: in flat mode (use_hierarchical=False), carry.inner_carry.z_H mirrors z_L
+    # (single-latent final state). h_states_final semantics preserved: mean-pooled content.
     h_states_final = None
     if extract_h_states:
         z_H = carry.inner_carry.z_H

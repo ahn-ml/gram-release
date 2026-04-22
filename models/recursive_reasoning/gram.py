@@ -75,6 +75,9 @@ class GenerativeRecursiveReasoningModelConfig(BaseModel):
     # Value head parameters
     use_value_head: bool = False  # Add value head to predict current state accuracy
 
+    # Hierarchical ablation
+    use_hierarchical: bool = True  # If False: drop z_H, single latent z with VAE guidance only
+
     # Patchify parameters (for image data)
     use_patchify: bool = False  # Enable patchify for image inputs
     patch_size: int = 2  # Patch size (2 for MNIST)
@@ -402,8 +405,11 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: GenerativeRecursiveReasoningModelInnerCarry):
+        # In flat mode, forward() reads only z_L; mirror L_init into z_H slot so
+        # both fields hold the same init distribution (cosmetic — z_H unused in flat).
+        z_H_init = self.L_init if not self.config.use_hierarchical else self.H_init
         return GenerativeRecursiveReasoningModelInnerCarry(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
+            z_H=torch.where(reset_flag.view(-1, 1, 1), z_H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
@@ -416,17 +422,28 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         # Forward iterations
+        # Note: when use_hierarchical=False and H_cycles=1, the no-grad outer loop is skipped
+        # entirely (range(0)) so mid-loop VAE guidance does not fire — final grad pass only.
         z_H, z_L = carry.z_H, carry.z_L
+        # Precompute input puzzle_emb slice for flat mode's slow-state preservation
+        input_puzzle_emb = input_embeddings[:, :self.puzzle_emb_len]
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-                z_H = self.L_level(z_H, z_L, **seq_info)
+                    if not self.config.use_hierarchical:
+                        # Flat mode: restore puzzle_emb slots to input value so puzzle signal
+                        # stays at a slow timescale (analogous to hierarchical z_H's stability).
+                        z_L = torch.cat([input_puzzle_emb, z_L[:, self.puzzle_emb_len:]], dim=1)
+                    injection = (z_H + input_embeddings) if self.config.use_hierarchical else input_embeddings
+                    z_L = self.L_level(z_L, injection, **seq_info)
+                if self.config.use_hierarchical:
+                    z_H = self.L_level(z_H, z_L, **seq_info)
 
                 # Variational in the middle of cycles (posterior during training, prior during eval)
-                puzzle_emb = z_H[:, :self.puzzle_emb_len]
-                h_t = z_H[:, self.puzzle_emb_len:]
+                guide = z_H if self.config.use_hierarchical else z_L
+                puzzle_emb = guide[:, :self.puzzle_emb_len]
+                h_t = guide[:, self.puzzle_emb_len:]
 
                 if self.training:
                     if self.config.use_patchify:
@@ -442,16 +459,25 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
                 z_proj_flat = self.variational.z_proj(z_flat)  # (B*N, hidden_size)
                 z = z_proj_flat.reshape(B, N, -1).to(self.forward_dtype)  # (B, N, D)
                 h_t_conditioned = h_t + z
-                z_H = torch.cat([puzzle_emb, h_t_conditioned], dim=1)
+                guided = torch.cat([puzzle_emb, h_t_conditioned], dim=1)
+                if self.config.use_hierarchical:
+                    z_H = guided
+                else:
+                    z_L = guided
 
         # 1 with grad
         for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.L_level(z_H, z_L, **seq_info)
+            if not self.config.use_hierarchical:
+                # Flat mode: restore puzzle_emb slots to input value (slow-state preservation)
+                z_L = torch.cat([input_puzzle_emb, z_L[:, self.puzzle_emb_len:]], dim=1)
+            injection = (z_H + input_embeddings) if self.config.use_hierarchical else input_embeddings
+            z_L = self.L_level(z_L, injection, **seq_info)
+        if self.config.use_hierarchical:
+            z_H = self.L_level(z_H, z_L, **seq_info)
 
-        
-        puzzle_emb = z_H[:, :self.puzzle_emb_len]
-        h_T = z_H[:, self.puzzle_emb_len:]
+        final_state = z_H if self.config.use_hierarchical else z_L
+        puzzle_emb = final_state[:, :self.puzzle_emb_len]
+        h_T = final_state[:, self.puzzle_emb_len:]
         sample_in = h_T
         # Variational sampling
         vae_outputs = {}
@@ -480,8 +506,11 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
         h_T_conditioned = h_T + z  # (B, N, D)
 
         # LM Outputs
-        z_H_conditioned = torch.cat([puzzle_emb, h_T_conditioned], dim=1)
-        new_carry = GenerativeRecursiveReasoningModelInnerCarry(z_H=z_H_conditioned.detach(), z_L=z_L.detach())
+        final_cat = torch.cat([puzzle_emb, h_T_conditioned], dim=1)
+        if self.config.use_hierarchical:
+            new_carry = GenerativeRecursiveReasoningModelInnerCarry(z_H=final_cat.detach(), z_L=z_L.detach())
+        else:
+            new_carry = GenerativeRecursiveReasoningModelInnerCarry(z_H=final_cat.detach(), z_L=final_cat.detach())
         if self.config.use_patchify:
             # (B, num_patches, hidden) -> (B, num_patches, p*p*C*vocab) -> (B, C, H, W, vocab) -> (B, seq, vocab)
             patch_logits = self.patch_out(h_T_conditioned)
