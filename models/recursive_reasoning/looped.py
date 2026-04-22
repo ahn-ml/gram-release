@@ -200,15 +200,16 @@ class LoopedTransformerInner(nn.Module):
     ) -> Tuple[LoopedTransformerInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None)
 
-        # Embed once at the start of this inner forward (one per ACT step).
+        # Yang-style Looped Transformer: input embedding re-injected every cycle.
+        #   z_{t+1} = TB(z_t + x)   (arXiv:2311.12424, Def 5.2 of arXiv:2502.17416 is the outlier).
+        # Same input-injection convention as TRM's L_level(z, z_H + input_emb) with hierarchy stripped.
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
-        z = carry.z + input_embeddings
+        z = carry.z
 
-        # Weight-tied recursive pass: T applications of the same backbone, no input re-injection.
         with torch.no_grad():
             for _ in range(self.config.total_cycles - 1):
-                z = self.backbone(z, **seq_info)
-        z = self.backbone(z, **seq_info)
+                z = self.backbone(z + input_embeddings, **seq_info)
+        z = self.backbone(z + input_embeddings, **seq_info)
 
         new_carry = LoopedTransformerInnerCarry(z=z.detach())
         logits = self.lm_head(z)[:, self.puzzle_emb_len:]
