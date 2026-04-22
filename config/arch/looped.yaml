@@ -1,0 +1,31 @@
+name: recursive_reasoning.looped@LoopedTransformer
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+# T — number of weight-tied TB applications per inner forward.
+# 21 FLOP-matches GRAM/TRM: they do H_cycles×L_cycles=18 L_level calls on z_L plus H_cycles=3 extra
+# L_level calls on z_H, total 21 backbone applications per inner forward.
+total_cycles: 21
+
+# Depth of the shared TB stack.
+L_layers: 2
+
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+
+pos_encodings: rope
+forward_dtype: bfloat16
+
+mlp_t: False
+puzzle_emb_len: 16
+no_ACT_continue: True
+
+temperature: 0.0
+use_mlp_lm_head: False
