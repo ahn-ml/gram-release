@@ -39,6 +39,7 @@ free_bits: null # free bits for KL loss (null=disabled, e.g., 0.1=minimum KL per
 use_mlp_sampler: true # use MLP encoders for prior/posterior (False=linear projection, True=SwiGLU MLP)
 fix_mu: False # if True, force mu = 0 for both prior and posterior (ablation)
 fix_std: False # if True, force std = 0 for both prior and posterior, deterministic (ablation)
+film_epsilon: False # if True, inject z via FiLM ((1+γ)*h + β) instead of additive (h + z)
 
 # Value head parameters
 use_value_head: False # add value head to predict current state accuracy (False=disabled, True=enabled)
