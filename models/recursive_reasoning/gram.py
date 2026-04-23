@@ -64,6 +64,7 @@ class GenerativeRecursiveReasoningModelConfig(BaseModel):
     latent_dim: int = 256
     kl_coef: float = 0.1
     use_mlp_sampler: bool = False  # Use MLP for prior/posterior instead of linear projection
+    film_epsilon: bool = False  # If True, inject z via FiLM ((1+γ)*h + β) instead of additive (h + z)
 
     # Variational sampling control (for ablation)
     fix_mu: bool = False  # If True, force mu = 0 (both prior and posterior)
@@ -88,11 +89,12 @@ class GenerativeRecursiveReasoningModelConfig(BaseModel):
 class VariationalLayer(nn.Module):
     """Variational layer with optional MLP encoders"""
     def __init__(self, hidden_size: int, latent_dim: int, vocab_size: int, use_mlp: bool = False, expansion: float = 2.0,
-                 fix_mu: bool = False, fix_std: bool = False, posterior_y_dim: int = None):
+                 fix_mu: bool = False, fix_std: bool = False, posterior_y_dim: int = None, use_film: bool = False):
         super().__init__()
         self.use_mlp = use_mlp
         self.fix_mu = fix_mu
         self.fix_std = fix_std
+        self.use_film = use_film
         # posterior_y_dim: dimension of y input for posterior (default: vocab_size, or hidden_size for patchify)
         self.posterior_y_dim = posterior_y_dim if posterior_y_dim is not None else vocab_size
 
@@ -102,9 +104,6 @@ class VariationalLayer(nn.Module):
 
             # Posterior: q(z|x, y) - MLP encoder outputs 2*latent_dim (mu and logvar)
             self.post_mlp = SwiGLU(hidden_size + self.posterior_y_dim, expansion, out_dim=2 * latent_dim)
-
-            # Project z back to hidden_size
-            self.z_proj = nn.Linear(latent_dim, hidden_size)
         else:
             # Prior: p(z|x) - Linear projection
             self.prior_mu = nn.Linear(hidden_size, latent_dim)
@@ -114,8 +113,12 @@ class VariationalLayer(nn.Module):
             self.post_mu = nn.Linear(hidden_size + self.posterior_y_dim, latent_dim)
             self.post_logvar = nn.Linear(hidden_size + self.posterior_y_dim, latent_dim)
 
-            # Project z back to hidden_size
-            self.z_proj = nn.Linear(latent_dim, hidden_size)
+        # z injection: additive (latent→hidden) or FiLM (latent→2*hidden for γ,β, zero-init → identity at start)
+        proj_out = 2 * hidden_size if use_film else hidden_size
+        self.z_proj = nn.Linear(latent_dim, proj_out)
+        if use_film:
+            nn.init.zeros_(self.z_proj.weight)
+            nn.init.zeros_(self.z_proj.bias)
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -175,6 +178,17 @@ class VariationalLayer(nn.Module):
         logvar = logvar.reshape(B, N, -1)
         z = z.reshape(B, N, -1)
         return z, mu, logvar
+
+    def apply_condition(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """Inject latent z into hidden h. h: (B,N,D), z: (B,N,latent_dim). Returns (B,N,D) in h.dtype."""
+        B, N, L = z.shape
+        out = self.z_proj(z.reshape(B * N, L).to(torch.float32))
+        if self.use_film:
+            gamma, beta = out.chunk(2, dim=-1)
+            gamma = gamma.reshape(B, N, -1).to(h.dtype)
+            beta = beta.reshape(B, N, -1).to(h.dtype)
+            return (1 + gamma) * h + beta
+        return h + out.reshape(B, N, -1).to(h.dtype)
 
 
 class GenerativeRecursiveReasoningModelBlock(nn.Module):
@@ -283,7 +297,8 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
             use_mlp=self.config.use_mlp_sampler,
             fix_mu=self.config.fix_mu,
             fix_std=self.config.fix_std,
-            posterior_y_dim=posterior_y_dim
+            posterior_y_dim=posterior_y_dim,
+            use_film=self.config.film_epsilon,
         )
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
@@ -453,12 +468,8 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
                     z, _, _ = self.variational.sample_posterior(h_t, y_tar)
                 else:
                     z, _, _ = self.variational.sample_prior(h_t)
-                # Decode: condition h_t on z (per-token z)
-                B, N, _ = z.shape
-                z_flat = z.reshape(B * N, -1)  # (B*N, latent_dim)
-                z_proj_flat = self.variational.z_proj(z_flat)  # (B*N, hidden_size)
-                z = z_proj_flat.reshape(B, N, -1).to(self.forward_dtype)  # (B, N, D)
-                h_t_conditioned = h_t + z
+                # Decode: condition h_t on z (additive or FiLM per config.film_epsilon)
+                h_t_conditioned = self.variational.apply_condition(h_t, z)
                 guided = torch.cat([puzzle_emb, h_t_conditioned], dim=1)
                 if self.config.use_hierarchical:
                     z_H = guided
@@ -498,12 +509,8 @@ class GenerativeRecursiveReasoningModelInner(nn.Module):
         else:
             z = z_pred
 
-        # Decode: condition h_T on z (per-token z)
-        B, N, _ = z.shape
-        z_flat = z.reshape(B * N, -1)  # (B*N, latent_dim)
-        z_proj_flat = self.variational.z_proj(z_flat)  # (B*N, hidden_size)
-        z = z_proj_flat.reshape(B, N, -1).to(self.forward_dtype)  # (B, N, D)
-        h_T_conditioned = h_T + z  # (B, N, D)
+        # Decode: condition h_T on z (additive or FiLM per config.film_epsilon)
+        h_T_conditioned = self.variational.apply_condition(h_T, z)
 
         # LM Outputs
         final_cat = torch.cat([puzzle_emb, h_T_conditioned], dim=1)
