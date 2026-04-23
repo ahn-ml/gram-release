@@ -7,9 +7,12 @@ halt_exploration_prob: 0.1
 halt_max_steps: 16
 
 # T — number of weight-tied TB applications per inner forward.
-# 21 FLOP-matches GRAM/TRM: they do H_cycles×L_cycles=18 L_level calls on z_L plus H_cycles=3 extra
-# L_level calls on z_H, total 21 backbone applications per inner forward.
 total_cycles: 21
+
+# K — Yang multi-iter loss window (arXiv:2311.12424): last K cycles produce readouts;
+# loss = mean of K per-cycle CEs. First (T-K) cycles are no_grad (memory saver).
+# 0 or >=T → K = T (all cycles on autograd tape, fully supervised).
+supervision_cycles: 21
 
 # Depth of the shared TB stack.
 L_layers: 2

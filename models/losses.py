@@ -116,7 +116,17 @@ class ACTLossHead(nn.Module):
             }
 
         # Losses
-        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+        if "intermediate_logits" in outputs:
+            # Yang multi-iter loss: per-cycle CE averaged across K readouts (arXiv:2311.12424).
+            # intermediate_logits shape: (K, B, seq, vocab)
+            inter = outputs["intermediate_logits"]
+            K = inter.shape[0]
+            lm_loss = sum(
+                (self.loss_fn(inter[k], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+                for k in range(K)
+            ) / K
+        else:
+            lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
         metrics.update({
             "lm_loss": lm_loss.detach(),

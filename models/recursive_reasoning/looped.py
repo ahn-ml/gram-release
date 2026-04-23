@@ -32,6 +32,10 @@ class LoopedTransformerConfig(BaseModel):
     vocab_size: int
 
     total_cycles: int  # T — number of weight-tied TB applications per inner forward
+    supervision_cycles: int = 0  # K — last K cycles: grad tape + per-cycle readout + per-cycle CE loss
+                                  # (Yang multi-iter loss, arXiv:2311.12424). Final loss = mean of K CEs.
+                                  # First (T-K) cycles run under no_grad for memory saving.
+                                  # 0 or >=T → K = T (fully supervised).
 
     L_layers: int      # depth of the shared TB (stack of transformer blocks)
 
@@ -197,28 +201,41 @@ class LoopedTransformerInner(nn.Module):
         self,
         carry: LoopedTransformerInnerCarry,
         batch: Dict[str, torch.Tensor],
-    ) -> Tuple[LoopedTransformerInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[LoopedTransformerInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         seq_info = dict(cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None)
 
-        # Yang-style Looped Transformer: input embedding re-injected every cycle.
-        #   z_{t+1} = TB(z_t + x)   (arXiv:2311.12424, Def 5.2 of arXiv:2502.17416 is the outlier).
-        # Same input-injection convention as TRM's L_level(z, z_H + input_emb) with hierarchy stripped.
+        # Yang-style Looped Transformer (arXiv:2311.12424).
+        #   z_{t+1} = TB(z_t + x) — weight-tied recurrence, input re-injected every cycle.
+        #   Training: Yang multi-iter loss — last K cycles each produce a readout; loss = mean of K CEs.
+        #   First (T-K) cycles run under no_grad (memory saver, Yang n_loop_start convention).
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
         z = carry.z
 
+        K = self.config.supervision_cycles
+        if K <= 0 or K >= self.config.total_cycles:
+            K = self.config.total_cycles
+        warmup = self.config.total_cycles - K
+
         with torch.no_grad():
-            for _ in range(self.config.total_cycles - 1):
+            for _ in range(warmup):
                 z = self.backbone(z + input_embeddings, **seq_info)
-        z = self.backbone(z + input_embeddings, **seq_info)
+
+        intermediate_logits = []
+        for _ in range(K):
+            z = self.backbone(z + input_embeddings, **seq_info)
+            intermediate_logits.append(self.lm_head(z)[:, self.puzzle_emb_len:])
+
+        logits = intermediate_logits[-1]
+        # (K, B, seq, vocab) — ACTLossHead averages CE across K (multi-iter loss).
+        stacked_logits = torch.stack(intermediate_logits, dim=0)
 
         new_carry = LoopedTransformerInnerCarry(z=z.detach())
-        logits = self.lm_head(z)[:, self.puzzle_emb_len:]
 
         if not self.training and self.config.temperature > 0.0:
             logits = logits / self.config.temperature
 
         q_logits = self.q_head(z[:, 0]).to(torch.float32)
-        return new_carry, logits, (q_logits[..., 0], q_logits[..., 1])
+        return new_carry, logits, (q_logits[..., 0], q_logits[..., 1]), stacked_logits
 
 
 class LoopedTransformer(nn.Module):
@@ -254,12 +271,13 @@ class LoopedTransformer(nn.Module):
             for k, v in carry.current_data.items()
         }
 
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), stacked_logits = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits,
+            "intermediate_logits": stacked_logits,  # always emit — Yang multi-iter loss is mandatory
         }
 
         with torch.no_grad():
@@ -280,7 +298,7 @@ class LoopedTransformer(nn.Module):
                 halted = halted & (new_steps >= min_halt_steps)
 
                 if not self.config.no_ACT_continue:
-                    _, _, (next_q_halt_logits, next_q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+                    _, _, (next_q_halt_logits, next_q_continue_logits), _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(
                         torch.where(
                             is_last_step,
