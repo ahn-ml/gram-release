@@ -37,7 +37,7 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str, kl_coef: float = 0.0, kl_balance_alpha: Optional[float] = None, free_bits: Optional[float] = None, value_coef: float = 1.0, data_path: Optional[str] = None):
+    def __init__(self, model: nn.Module, loss_type: str, kl_coef: float = 0.0, kl_balance_alpha: Optional[float] = None, free_bits: Optional[float] = None, value_coef: float = 1.0, data_path: Optional[str] = None, kl_seq_mean: bool = False):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
@@ -45,6 +45,7 @@ class ACTLossHead(nn.Module):
         self.kl_balance_alpha = kl_balance_alpha  # If not None, use KL balancing (e.g., 0.8)
         self.free_bits = free_bits  # If not None, apply free bits to KL (e.g., 0.1)
         self.value_coef = value_coef  # Coefficient for value loss
+        self.kl_seq_mean = kl_seq_mean  # If True, per-sample KL normalized by min(valid_tokens, N_kl) then batch-sum
 
         # Detect task type from data_path for task-specific verification
         self.is_nqueen = False
@@ -138,11 +139,21 @@ class ACTLossHead(nn.Module):
                 metrics["kl_loss"] = kl_loss.detach()
             else:
                 def compute_kl(post_mu, post_logvar, prior_mu, prior_logvar):
-                    return torch.sum(0.5 * (
+                    kl = 0.5 * (
                         prior_logvar - post_logvar - 1
                         + torch.exp(post_logvar - prior_logvar)
                         + ((post_mu - prior_mu) ** 2) / torch.exp(prior_logvar)
-                    ))
+                    )  # (B, N_kl, latent_dim)
+                    if self.kl_seq_mean:
+                        kl = kl.sum(dim=-1)  # (B, N_kl)
+                        N_kl = kl.shape[1]
+                        # aligned case (e.g., nqueens/graph/arc): zero out invalid positions to match lm_loss masking.
+                        # patchify case (N_kl != seq_len): fall back to latent-position mean.
+                        if mask.shape[1] == N_kl:
+                            kl = kl * mask.to(kl.dtype)
+                        kl_divisor = loss_divisor.clamp(max=N_kl)  # (B, 1) = min(valid_tokens, N_kl)
+                        return (kl / kl_divisor).sum()  # per-sample seq-mean, batch sum
+                    return torch.sum(kl)
 
                 if self.kl_balance_alpha is not None:
                     # KL balancing: alpha * KL(sg(post) || prior) + (1-alpha) * KL(post || sg(prior))

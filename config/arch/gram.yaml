@@ -6,6 +6,7 @@ loss:
   kl_balance_alpha: ${..kl_balance_alpha}
   free_bits: ${..free_bits}
   value_coef: ${..value_coef}
+  kl_seq_mean: ${..kl_seq_mean}
 
 halt_exploration_prob: 0.1
 halt_max_steps: 16
@@ -36,6 +37,7 @@ latent_dim: 256  # dimension of latent variable z
 kl_coef: 0.1 # coefficient for KL divergence loss
 kl_balance_alpha: null # KL balancing alpha (null=disabled, 0.8=enabled with DreamerV3 setting)
 free_bits: null # free bits for KL loss (null=disabled, e.g., 0.1=minimum KL per latent dimension)
+kl_seq_mean: False # if True, normalize KL per sample by min(valid_tokens, N_kl) then sum over batch (matches lm_loss scaling). Default False = sum over all (B, N, D).
 use_mlp_sampler: true # use MLP encoders for prior/posterior (False=linear projection, True=SwiGLU MLP)
 fix_mu: False # if True, force mu = 0 for both prior and posterior (ablation)
 fix_std: False # if True, force std = 0 for both prior and posterior, deterministic (ablation)
