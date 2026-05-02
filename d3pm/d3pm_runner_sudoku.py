@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, TensorDataset
@@ -15,6 +16,37 @@ import wandb
 from d3pm_runner import D3PM
 from dit import DiT_Llama
 from evaluators.sudoku_utils import batch_verify_sudoku
+
+
+class DiT_Sudoku(DiT_Llama):
+    """Small-board variant: nn.Embedding instead of conv+patchify (patch_size=1)."""
+
+    def __init__(self, in_channels, N, input_size, dim, **kwargs):
+        super().__init__(
+            in_channels=in_channels, N=N, input_size=input_size,
+            patch_size=1, dim=dim, **kwargs,
+        )
+        del self.init_conv_seq
+        del self.x_embedder
+        self.token_embedder = nn.Embedding(N, dim)
+
+    def forward(self, x, t, y):
+        self.freqs_cis = self.freqs_cis.to(x.device)
+        x_onehot = nn.functional.one_hot(x, self.N).float().to(x.device)
+        h = self.token_embedder(x.view(x.shape[0], -1))
+
+        adaln_input = self.t_embedder(t) + self.y_embedder(y, self.training)
+        for layer in self.layers:
+            h = layer(h, self.freqs_cis[: h.size(1)], adaln_input=adaln_input)
+
+        h = self.final_layer(h, adaln_input)
+        h = self.unpatchify(h)
+
+        x_out, gate = (
+            h.reshape(h.shape[0], -1, self.N * 2, *h.shape[2:])
+             .transpose(2, -1).contiguous()
+        ).chunk(2, dim=-1)
+        return x_out + x_onehot * (1 + gate).abs()
 
 
 def setup_ddp():
@@ -236,7 +268,7 @@ if __name__ == "__main__":
     class_dropout_prob = config["class_dropout_prob"]
 
     d3pm = D3PM(
-        DiT_Llama(in_channels, N, input_size=img_size, class_dropout_prob=class_dropout_prob, n_layers=n_layers, n_heads=n_heads, dim=dim), timesteps, num_classes=N, hybrid_loss_coeff=hybrid_loss_coeff, forward_type=forward_type
+        DiT_Sudoku(in_channels, N, input_size=img_size, class_dropout_prob=class_dropout_prob, n_layers=n_layers, n_heads=n_heads, dim=dim), timesteps, num_classes=N, hybrid_loss_coeff=hybrid_loss_coeff, forward_type=forward_type
     ).to(device)
 
     num_param = sum([p.numel() for p in d3pm.x0_model.parameters()])
