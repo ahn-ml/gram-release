@@ -30,7 +30,7 @@ class Sudoku:
         self,
         data_path: str,
         eval_metadata: PuzzleDatasetMetadata,
-        pass_Ks: Sequence[int] = (1, 5, 10, 50, 100),
+        pass_Ks: Sequence[int] = (1,),
         aggregated_voting: bool = True
     ):
         super().__init__()
@@ -47,10 +47,15 @@ class Sudoku:
 
         # NEW: Track correctness distribution in K samples
         # correctness_counts[i] = how many puzzles have exactly i correct answers in K samples
-        self._correctness_counts = [0 for _ in range(101)]  # Support up to K=100
+        self._correctness_counts = [0 for _ in range(max(self.pass_Ks) + 1)]
 
         # Track uniqueness: sum of unique predictions per puzzle
         self._total_unique_samples = 0
+
+    def set_train_vocab_size(self, vocab_size: int): pass
+    def set_step(self, step: int): pass
+    def scale_batch(self, batch): return batch, None
+    def precompute_real_features(self, eval_loader, device): pass
 
     def begin_eval(self):
         # Reset counters
@@ -60,11 +65,30 @@ class Sudoku:
         self._majority_token_correct = 0.0
         self._majority_ratio_sum = 0.0
         self._total_puzzles = 0
-        self._correctness_counts = [0 for _ in range(101)]
+        self._correctness_counts = [0 for _ in range(max(self.pass_Ks) + 1)]
         self._total_unique_samples = 0
         # Best-of-N metrics (value network)
         self._best_of_n_exact = 0.0
         self._best_of_n_token = 0.0
+
+    def update_batch(self, batch: Dict[str, torch.Tensor], preds: Dict[str, torch.Tensor], original_labels=None):
+        from evaluators.sudoku_utils import batch_verify_sudoku
+
+        labels = batch["labels"]
+        predictions = preds["preds"]
+        mask = labels != -100
+        loss_counts = mask.sum(-1)
+        self.update_batch_samples(batch, [{
+            "preds": predictions,
+            "q_halt_logits": preds["q_halt_logits"],
+            "exact_correct": batch_verify_sudoku(batch["inputs"], predictions),
+            "token_accuracy": torch.where(
+                loss_counts > 0,
+                ((predictions == labels) & mask).sum(-1).float() / loss_counts.float(),
+                torch.zeros_like(loss_counts, dtype=torch.float32),
+            ),
+            "valid": loss_counts > 0,
+        }], 1)
 
     def update_batch_samples(self, batch: Dict[str, torch.Tensor], batch_samples: list, num_samples: int, best_of_n_metrics: Optional[Dict] = None):
         """Process K samples for a batch and compute metrics on-the-fly.
@@ -75,6 +99,9 @@ class Sudoku:
             num_samples: K (number of samples)
             best_of_n_metrics: Optional dict with best-of-N selection results from value network
         """
+        if num_samples >= len(self._correctness_counts):
+            self._correctness_counts.extend([0] * (num_samples + 1 - len(self._correctness_counts)))
+
         # Collect correctness metrics (already computed in eval_pass_at_k.py)
         all_exact_correct = []
         all_token_accuracy = []
@@ -209,7 +236,7 @@ class Sudoku:
         global_exact_correct = [global_counts[offset + i].item() for i in range(len(self.pass_Ks))]
         global_token_correct = [global_counts[offset + len(self.pass_Ks) + i].item() for i in range(len(self.pass_Ks))]
         offset = 7 + len(self.pass_Ks) * 2
-        global_correctness_counts = [int(global_counts[offset + i].item()) for i in range(101)]
+        global_correctness_counts = [int(global_counts[offset + i].item()) for i in range(len(self._correctness_counts))]
 
         # Compute final metrics (percentages from aggregated counts)
         results = {}
@@ -227,7 +254,8 @@ class Sudoku:
             exact_acc = global_exact_correct[i] / total_puzzles if total_puzzles > 0 else 0.0
             token_acc = global_token_correct[i] / total_puzzles if total_puzzles > 0 else 0.0
             results[f"Sudoku/exact_pass@{k}"] = exact_acc
-            results[f"Sudoku/pass@{k}"] = token_acc
+            results[f"Sudoku/pass@{k}"] = exact_acc
+            results[f"Sudoku/token_best@{k}"] = token_acc
 
         # Best-of-N (value network selection)
         if global_best_of_n_exact > 0 or global_best_of_n_token > 0:
