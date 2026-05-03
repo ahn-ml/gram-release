@@ -1,4 +1,5 @@
 import os
+import random
 import argparse
 import numpy as np
 import torch
@@ -102,27 +103,44 @@ def evaluate_fid_is(model, fid_metric, is_metric, N, forward_type, device, rank,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None, help="checkpoint path to resume")
+    parser.add_argument("--seed", type=int, default=42, help="random seed")
+    parser.add_argument("--forward_type", type=str, default="absorb_zero",
+                        choices=["absorb", "absorb_zero", "uniform"], help="D3PM forward process")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="wandb run_name; defaults to d3pm_mnist_<forward_type>_seed<seed>")
+    parser.add_argument("--checkpoint_path", type=str, default=None,
+                        help="checkpoint dir; defaults to checkpoints_mnist_<forward_type>_seed<seed>")
     args = parser.parse_args()
-    
+
+    # Seed everything (per-rank offset done after DDP init below)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    run_name = args.run_name or f"d3pm_mnist_{args.forward_type}_seed{args.seed}"
+    checkpoint_path = args.checkpoint_path or f"checkpoints_mnist_{args.forward_type}_seed{args.seed}"
+
     config = {
         "data": "mnist",  # "cifar10" or "mnist"
         "N": 2,
         "n_layers": 3,
         "n_heads": 8,
         "dim": 512,
-        "forward_type": "absorb_zero",
+        "forward_type": args.forward_type,
         "timesteps": 1000,
         "class_dropout_prob": 1.0,
         "lr": 2e-5,
         "hybrid_loss_coeff": 0.0,
         "batch_size": 64,
-        "max_steps": 1_500_000,
+        "max_steps": 450_000,
         "save_interval": 10000,
         "eval_interval": 10000,
         "eval_samples": 5000,
-        "run_name": "d3pm_mnist_absorb_zero",
+        "seed": args.seed,
+        "run_name": run_name,
         "project_name": "v_trm_d3pm_mnist",
-        "checkpoint_path": "checkpoints_absorb_zero_mnist"
+        "checkpoint_path": checkpoint_path,
     }
     
     # Dataset-specific settings
