@@ -8,8 +8,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
-from PIL import Image
-from torchvision.utils import make_grid
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 import wandb
@@ -18,13 +17,112 @@ from dit import DiT_Llama
 from evaluators.sudoku_utils import batch_verify_sudoku
 
 
+def sudoku_conflicts(board):
+    """board: (9,9) token space (PAD=0, blank=1, digits 2..10).
+    Returns (9,9) bool mask of cells violating sudoku rules or holding invalid tokens."""
+    board = np.asarray(board)
+    mask = np.zeros((9, 9), dtype=bool)
+    invalid = (board < 2) | (board > 10)  # PAD or blank or OOB
+    mask |= invalid
+    digits = np.where(invalid, 0, board)
+    for v in range(2, 11):
+        for i in range(9):
+            idx = np.where(digits[i] == v)[0]
+            if len(idx) > 1:
+                mask[i, idx] = True
+            idx = np.where(digits[:, i] == v)[0]
+            if len(idx) > 1:
+                mask[idx, i] = True
+        for br in range(0, 9, 3):
+            for bc in range(0, 9, 3):
+                box = digits[br:br+3, bc:bc+3]
+                rr, cc = np.where(box == v)
+                if len(rr) > 1:
+                    mask[br + rr, bc + cc] = True
+    return mask
+
+
+_VIZ_FONT = None
+def _viz_font(size=15):
+    global _VIZ_FONT
+    if _VIZ_FONT is None:
+        for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+            if os.path.exists(p):
+                _VIZ_FONT = ImageFont.truetype(p, size)
+                break
+        if _VIZ_FONT is None:
+            _VIZ_FONT = ImageFont.load_default()
+    return _VIZ_FONT
+
+
+def render_sudoku_grid(boards, conflicts_list=None, title=None, cell=48, gap=12):
+    """boards: (B,9,9) token space (PAD=0, blank=1, digits 2..10 = "1".."9").
+    conflicts_list: list of (9,9) bool masks or None. 2x2 layout for up to 4 boards.
+    Conflicting cells get red bg + red digit; non-digit token→'?'."""
+    rows, cols = 2, 2
+    bs = 9 * cell
+    title_h = 24 if title else 0
+    W = cols * bs + (cols + 1) * gap
+    H = rows * bs + (rows + 1) * gap + title_h
+    img = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(img)
+    font = _viz_font(size=int(cell * 0.7))
+    if title:
+        draw.text((gap, 4), title, fill="black", font=_viz_font(size=15))
+    for b_idx in range(min(rows * cols, len(boards))):
+        r, c = divmod(b_idx, cols)
+        x0 = gap + c * (bs + gap)
+        y0 = title_h + gap + r * (bs + gap)
+        board = np.asarray(boards[b_idx])
+        conf = conflicts_list[b_idx] if conflicts_list is not None else None
+        for i in range(9):
+            for j in range(9):
+                cx, cy = x0 + j * cell, y0 + i * cell
+                bg = "#ffd6d6" if (conf is not None and conf[i, j]) else "white"
+                draw.rectangle([cx, cy, cx + cell, cy + cell], fill=bg, outline="#bbbbbb")
+                v = int(board[i, j])
+                if 2 <= v <= 10:
+                    txt, color = str(v - 1), ("red" if (conf is not None and conf[i, j]) else "black")
+                elif v == 1:
+                    txt, color = "", "black"  # blank cell (incomplete)
+                else:
+                    txt, color = "?", "red"  # PAD or OOB
+                if txt:
+                    bbox = draw.textbbox((0, 0), txt, font=font)
+                    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                    draw.text((cx + (cell - tw) / 2 - bbox[0],
+                               cy + (cell - th) / 2 - bbox[1]),
+                              txt, fill=color, font=font)
+        for k in range(0, 10, 3):
+            draw.line([x0 + k * cell, y0, x0 + k * cell, y0 + 9 * cell], fill="black", width=2)
+            draw.line([x0, y0 + k * cell, x0 + 9 * cell, y0 + k * cell], fill="black", width=2)
+    return img
+
+
+def render_sample(sample_boards, mark_conflicts=True):
+    """sample_boards: (B,9,9) token space. Render up to 4 boards (2x2)."""
+    confs = [sudoku_conflicts(b) for b in sample_boards] if mark_conflicts else None
+    return render_sudoku_grid(sample_boards, confs, title="Sample (red = rule violation or blank)")
+
+
+def make_init_noise(forward_type, batch_size, in_channels, img_size, N, device):
+    """Initial state for D3PM reverse sampling. Sudoku uses absorb_zero (PAD=0) or uniform."""
+    shape = (batch_size, in_channels, img_size, img_size)
+    if forward_type == "absorb_zero":
+        return torch.zeros(shape, dtype=torch.long, device=device)
+    if forward_type == "uniform":
+        return torch.randint(0, N, shape, dtype=torch.long, device=device)
+    raise NotImplementedError(f"forward_type={forward_type} not supported for sudoku")
+
+
 class DiT_Sudoku(DiT_Llama):
     """Small-board variant: nn.Embedding instead of conv+patchify (patch_size=1)."""
 
     def __init__(self, in_channels, N, input_size, dim, **kwargs):
         super().__init__(
             in_channels=in_channels, N=N, input_size=input_size,
-            patch_size=1, dim=dim, **kwargs,
+            patch_size=1, dim=dim, num_classes=N, **kwargs,
         )
         del self.init_conv_seq
         del self.x_embedder
@@ -148,11 +246,9 @@ def file_sha256(path):
 
 
 def load_sudoku_dataset(data_dir, split):
-    labels = np.load(os.path.join(data_dir, split, "all__labels.npy"))
-    boards = labels.reshape(-1, 9, 9).astype(np.float32) - 1
-    x = np.zeros((boards.shape[0], 1, 10, 10), dtype=np.float32)
-    x[:, 0, :9, :9] = boards
-    return TensorDataset(torch.from_numpy(x / 9), torch.zeros(len(x), dtype=torch.long))
+    labels = np.load(os.path.join(data_dir, split, "all__labels.npy"))   # token space {2..10}
+    x = labels.reshape(-1, 1, 9, 9).astype(np.int64)
+    return TensorDataset(torch.from_numpy(x), torch.zeros(len(x), dtype=torch.long))
 
 
 def seed_for_sampling(seed, step, rank, offset):
@@ -183,17 +279,9 @@ def evaluate_sudoku(model, N, forward_type, device, rank, world_size, in_channel
                 break
 
             conds = torch.full((cur_size,), N, dtype=torch.long, device=device)
-            if forward_type == "absorb":
-                init_noise = (torch.ones(cur_size, in_channels, img_size, img_size, device=device) * (N // 2)).long()
-            elif forward_type == "absorb_zero":
-                init_noise = torch.zeros(cur_size, in_channels, img_size, img_size, device=device).long()
-            elif forward_type == "uniform":
-                init_noise = torch.randint(0, N, (cur_size, in_channels, img_size, img_size), device=device)
-            else:
-                raise NotImplementedError()
-
+            init_noise = make_init_noise(forward_type, cur_size, in_channels, img_size, N, device)
             images = model.sample_with_image_sequence(init_noise, conds, stride=40)
-            pred = images[-1][:, 0, :9, :9].reshape(cur_size, 81) + 1
+            pred = images[-1][:, 0].reshape(cur_size, 81)  # already token space
             blank = torch.ones(cur_size, 81, dtype=torch.long, device=device)
             local_valid += batch_verify_sudoku(blank, pred).sum()
             local_total += cur_size
@@ -214,19 +302,24 @@ if __name__ == "__main__":
     parser.add_argument("--run-name", type=str, default="d3pm_sudoku_generation")
     parser.add_argument("--checkpoint-path", type=str, default="checkpoints_sudoku")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dim", type=int, default=512)
+    parser.add_argument("--n-layers", type=int, default=3)
+    parser.add_argument("--n-heads", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--forward-type", type=str, default="absorb_zero")
     args = parser.parse_args()
 
     config = {
         "data": "sudoku",
         "data_dir": args.data_dir,
-        "N": 10,
-        "n_layers": 3,
-        "n_heads": 8,
-        "dim": 512,
-        "forward_type": "uniform",
+        "N": 11,  # PAD=0, blank=1, digits 1..9 = token 2..10
+        "n_layers": args.n_layers,
+        "n_heads": args.n_heads,
+        "dim": args.dim,
+        "forward_type": args.forward_type,
         "timesteps": 1000,
         "class_dropout_prob": 1.0,
-        "lr": 2e-5,
+        "lr": args.lr,
         "hybrid_loss_coeff": 0.0,
         "batch_size": args.batch_size,
         "max_steps": args.max_steps,
@@ -242,7 +335,7 @@ if __name__ == "__main__":
     # Dataset-specific settings
     if config["data"] == "sudoku":
         in_channels = 1
-        img_size = 10
+        img_size = 9
     else:
         raise ValueError(f"Unknown data: {config['data']}")
 
@@ -343,8 +436,7 @@ if __name__ == "__main__":
             x = x.to(device)
             cond = cond.to(device)
 
-            # discritize x to N bins
-            x_cat = (x * (N - 1)).round().long().clamp(0, N - 1)
+            x_cat = x.long()  # token space, no normalize
             loss, info = d3pm(x_cat, cond)
 
             loss.backward()
@@ -379,29 +471,16 @@ if __name__ == "__main__":
                     seed_for_sampling(config["seed"], global_step, rank, 100000000)
                     with torch.no_grad():
                         cond_sample = torch.full((16,), N, dtype=torch.long, device=device)
-                        if forward_type == "absorb":
-                            init_noise = torch.ones(16, in_channels, img_size, img_size).to(device) * N//2
-                            init_noise = init_noise.to(torch.long)
-                        elif forward_type == "absorb_zero":
-                            init_noise = torch.zeros(16, in_channels, img_size, img_size, device=device).long()
-                        elif forward_type == "uniform":
-                            init_noise = torch.randint(0, N, (16, in_channels, img_size, img_size)).to(device)
-                        else:
-                            raise NotImplementedError()
+                        init_noise = make_init_noise(forward_type, 16, in_channels, img_size, N, device)
 
                         images = d3pm.module.sample_with_image_sequence(
                             init_noise, cond_sample, stride=40
                         )
-                        # image sequences to gif
+                        # sudoku-format gif: 4 samples (2x2), conflicts in red, blank cells empty
                         gif = []
                         for image in images:
-                            x_from_dataloader = x_cat[:16].cpu() / (N - 1)
-                            this_image = image.float().cpu() / (N - 1)
-                            all_images = torch.cat([x_from_dataloader, this_image], dim=0)
-                            x_as_image = make_grid(all_images, nrow=4)
-                            img = x_as_image.permute(1, 2, 0).cpu().numpy()
-                            img = (img * 255).astype(np.uint8)
-                            gif.append(Image.fromarray(img))
+                            sample_boards = image[:4, 0].cpu().numpy().astype(np.int64)
+                            gif.append(render_sample(sample_boards))
 
                         os.makedirs("contents", exist_ok=True)
                         gif[0].save(
