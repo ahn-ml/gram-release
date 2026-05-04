@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
+from models.recursive_reasoning.gram import VariationalLayer
 
 
 @dataclass
@@ -58,6 +59,14 @@ class LoopedTransformerConfig(BaseModel):
 
     temperature: float = 0.0
     use_mlp_lm_head: bool = False
+
+    # Stochastic guidance (GRAM-style periodic z injection on top of looped backbone).
+    # When False, model is identical to vanilla looped TF.
+    use_stochastic_guidance: bool = False
+    inject_period: int = 5        # P — TB calls per block (default = L_cycles+1 = 1 H-cycle)
+    supervised_blocks: int = 3    # K_b — last K_b blocks run with grad + readout + KL
+    latent_dim: int = 256
+    use_mlp_sampler: bool = False
 
 
 class LoopedTransformerBlock(nn.Module):
@@ -157,6 +166,15 @@ class LoopedTransformerInner(nn.Module):
             layers=[LoopedTransformerBlock(self.config) for _ in range(self.config.L_layers)]
         )
 
+        if self.config.use_stochastic_guidance:
+            self.variational = VariationalLayer(
+                hidden_size=self.config.hidden_size,
+                latent_dim=self.config.latent_dim,
+                vocab_size=self.config.vocab_size,
+                use_mlp=self.config.use_mlp_sampler,
+                expansion=self.config.expansion,
+            )
+
         self.z_init = nn.Buffer(
             trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
             persistent=True,
@@ -197,33 +215,100 @@ class LoopedTransformerInner(nn.Module):
             z=torch.where(reset_flag.view(-1, 1, 1), self.z_init, carry.z),
         )
 
+    def _inject(self, z: torch.Tensor, batch: Dict[str, torch.Tensor], capture_kl: bool):
+        """Periodic z injection (GRAM-style). Conditions token slots only; preserves puzzle_emb."""
+        puzzle_part = z[:, :self.puzzle_emb_len]
+        h = z[:, self.puzzle_emb_len:]
+
+        prior_mu = prior_logvar = post_mu = post_logvar = None
+        if self.training:
+            # Clamp ignored positions (IGNORE_LABEL_ID = -100) to 0 — they're masked out of
+            # the CE loss anyway; here we just need a valid one-hot for the posterior encoder.
+            labels_safe = batch["labels"].clamp(min=0).long()
+            y_oh = F.one_hot(labels_safe, num_classes=self.config.vocab_size).to(torch.float32)
+            z_var, post_mu_, post_logvar_ = self.variational.sample_posterior(h, y_oh)
+            if capture_kl:
+                _, prior_mu_, prior_logvar_ = self.variational.sample_prior(h)
+                prior_mu, prior_logvar = prior_mu_, prior_logvar_
+                post_mu, post_logvar = post_mu_, post_logvar_
+        else:
+            z_var, _, _ = self.variational.sample_prior(h)
+
+        B, N, _ = z_var.shape
+        z_proj_flat = self.variational.z_proj(z_var.reshape(B * N, -1))
+        h_cond = h + z_proj_flat.reshape(B, N, -1).to(self.forward_dtype)
+        new_z = torch.cat([puzzle_part, h_cond], dim=1)
+        return new_z, (prior_mu, prior_logvar, post_mu, post_logvar)
+
     def forward(
         self,
         carry: LoopedTransformerInnerCarry,
         batch: Dict[str, torch.Tensor],
-    ) -> Tuple[LoopedTransformerInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    ) -> Tuple[LoopedTransformerInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]]:
         seq_info = dict(cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None)
 
         # Yang-style Looped Transformer (arXiv:2311.12424).
         #   z_{t+1} = TB(z_t + x) — weight-tied recurrence, input re-injected every cycle.
         #   Training: Yang multi-iter loss — last K cycles each produce a readout; loss = mean of K CEs.
         #   First (T-K) cycles run under no_grad (memory saver, Yang n_loop_start convention).
+        # When use_stochastic_guidance=True: T total cycles are grouped into blocks of size P,
+        #   and a GRAM-style variational z is injected at every block boundary. The last K_b
+        #   blocks run with grad and produce readouts + (prior,posterior) for KL.
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
         z = carry.z
 
-        K = self.config.supervision_cycles
-        if K <= 0 or K >= self.config.total_cycles:
-            K = self.config.total_cycles
-        warmup = self.config.total_cycles - K
+        vae_outputs: Dict[str, torch.Tensor] = {}
 
-        with torch.no_grad():
-            for _ in range(warmup):
+        if self.config.use_stochastic_guidance:
+            P = self.config.inject_period
+            K_b = self.config.supervised_blocks
+            T = self.config.total_cycles
+            H_b = max(T // P, 1)
+            if K_b <= 0 or K_b > H_b:
+                K_b = H_b
+            warmup_b = H_b - K_b
+
+            with torch.no_grad():
+                for _ in range(warmup_b):
+                    for _ in range(P):
+                        z = self.backbone(z + input_embeddings, **seq_info)
+                    z, _ = self._inject(z, batch, capture_kl=False)
+
+            intermediate_logits = []
+            prior_mus, prior_logvars, post_mus, post_logvars = [], [], [], []
+            for _ in range(K_b):
+                for _ in range(P):
+                    z = self.backbone(z + input_embeddings, **seq_info)
+                z, (pmu, plv, qmu, qlv) = self._inject(z, batch, capture_kl=self.training)
+                intermediate_logits.append(self.lm_head(z)[:, self.puzzle_emb_len:])
+                if self.training:
+                    prior_mus.append(pmu); prior_logvars.append(plv)
+                    post_mus.append(qmu); post_logvars.append(qlv)
+
+            if self.training and prior_mus:
+                vae_outputs = {
+                    "prior_mu":     torch.stack(prior_mus, dim=0),
+                    "prior_logvar": torch.stack(prior_logvars, dim=0),
+                    "post_mu":      torch.stack(post_mus, dim=0),
+                    "post_logvar":  torch.stack(post_logvars, dim=0),
+                    # Explicit divisor so the loss head averages KL over K_b grad blocks
+                    # (mirrors lm_loss being averaged over K readouts in Yang multi-iter loss).
+                    "kl_n_blocks":  torch.tensor(len(prior_mus), device=z.device),
+                }
+        else:
+            K = self.config.supervision_cycles
+            if K <= 0 or K >= self.config.total_cycles:
+                K = self.config.total_cycles
+            warmup = self.config.total_cycles - K
+
+            with torch.no_grad():
+                for _ in range(warmup):
+                    z = self.backbone(z + input_embeddings, **seq_info)
+
+            intermediate_logits = []
+            for _ in range(K):
                 z = self.backbone(z + input_embeddings, **seq_info)
-
-        intermediate_logits = []
-        for _ in range(K):
-            z = self.backbone(z + input_embeddings, **seq_info)
-            intermediate_logits.append(self.lm_head(z)[:, self.puzzle_emb_len:])
+                intermediate_logits.append(self.lm_head(z)[:, self.puzzle_emb_len:])
 
         logits = intermediate_logits[-1]
         # (K, B, seq, vocab) — ACTLossHead averages CE across K (multi-iter loss).
@@ -235,7 +320,7 @@ class LoopedTransformerInner(nn.Module):
             logits = logits / self.config.temperature
 
         q_logits = self.q_head(z[:, 0]).to(torch.float32)
-        return new_carry, logits, (q_logits[..., 0], q_logits[..., 1]), stacked_logits
+        return new_carry, logits, (q_logits[..., 0], q_logits[..., 1]), stacked_logits, vae_outputs
 
 
 class LoopedTransformer(nn.Module):
@@ -271,13 +356,14 @@ class LoopedTransformer(nn.Module):
             for k, v in carry.current_data.items()
         }
 
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits), stacked_logits = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), stacked_logits, vae_outputs = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits,
             "intermediate_logits": stacked_logits,  # always emit — Yang multi-iter loss is mandatory
+            **vae_outputs,
         }
 
         with torch.no_grad():
@@ -298,7 +384,7 @@ class LoopedTransformer(nn.Module):
                 halted = halted & (new_steps >= min_halt_steps)
 
                 if not self.config.no_ACT_continue:
-                    _, _, (next_q_halt_logits, next_q_continue_logits), _ = self.inner(new_inner_carry, new_current_data)
+                    _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(
                         torch.where(
                             is_last_step,

@@ -2,6 +2,7 @@ name: recursive_reasoning.looped@LoopedTransformer
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
+  kl_coef: ${..kl_coef}
 
 halt_exploration_prob: 0.1
 halt_max_steps: 16
@@ -32,3 +33,17 @@ no_ACT_continue: True
 
 temperature: 0.0
 use_mlp_lm_head: False
+
+# Stochastic guidance (GRAM-style periodic z injection on top of looped backbone).
+# When False, model is identical to vanilla looped TF.
+use_stochastic_guidance: False
+# P — TB calls between consecutive injections. Default = L_cycles+1 = 5,
+# i.e. 1 H-cycle per block in the implicit TRM/GRAM mapping (T=(H*L+H)*halt=(3*4+3)*16=240,
+# so each block = 1 H-cycle and H_b = T/P = 48 = H_cycles*halt_max_steps).
+inject_period: 5
+# K_b — last K_b blocks run with grad + readout + KL.
+# Default = 3 → 15 supervised cycles, ≈ vanilla K=14, and 1 inner forward worth of grad.
+supervised_blocks: 3
+latent_dim: 256
+use_mlp_sampler: False
+kl_coef: 0.1            # only used when use_stochastic_guidance=True

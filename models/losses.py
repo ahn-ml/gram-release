@@ -167,6 +167,11 @@ class ACTLossHead(nn.Module):
                     # Standard KL
                     kl_loss = compute_kl(outputs["post_mu"], outputs["post_logvar"],
                                         outputs["prior_mu"], outputs["prior_logvar"])
+                # If the model stacked multiple grad blocks (e.g., looped + stochastic guidance),
+                # it sets kl_n_blocks so KL is averaged over them — matching the per-readout
+                # averaging of lm_loss. GRAM and other single-block VAEs omit this field.
+                if "kl_n_blocks" in outputs:
+                    kl_loss = kl_loss / outputs["kl_n_blocks"]
                 # Apply free bits if specified (per sample)
                 if self.free_bits is not None:
                     kl_loss = torch.clamp(kl_loss, min=self.free_bits)
