@@ -1,6 +1,7 @@
 import os
 import random
 import argparse
+from datetime import timedelta
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -23,7 +24,7 @@ from dit import DiT_Llama
 
 
 def setup_ddp():
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=timedelta(hours=1))
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
@@ -207,7 +208,7 @@ if __name__ == "__main__":
                 transforms.ToTensor(),
             ]),
         )
-        val_dataset = CIFAR10("./data", train=False, download=False, transform=transforms.ToTensor())
+        val_dataset = CIFAR10("./data", train=False, download=True, transform=transforms.ToTensor())
     elif config["data"] == "mnist":
         dataset = MNIST(
             "./data",
@@ -215,7 +216,7 @@ if __name__ == "__main__":
             download=is_main,
             transform=transforms.ToTensor(),
         )
-        val_dataset = MNIST("./data", train=False, download=False, transform=transforms.ToTensor())
+        val_dataset = MNIST("./data", train=False, download=True, transform=transforms.ToTensor())
     dist.barrier()  # wait for download
     
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -292,11 +293,6 @@ if __name__ == "__main__":
             
             global_step += 1
 
-            # Save checkpoint
-            if is_main and global_step % save_interval == 0:
-                save_checkpoint(config, d3pm, optim, global_step, f"{config['checkpoint_path']}/ckpt_{global_step}.pt")
-                save_checkpoint(config, d3pm, optim, global_step, f"{config['checkpoint_path']}/ckpt_latest.pt")
-
             if is_main and global_step % 600 == 1:
                 d3pm.module.eval()
 
@@ -360,6 +356,11 @@ if __name__ == "__main__":
                         step=global_step,
                     )
                 d3pm.train()
+
+            # Save checkpoint (after eval to avoid main-rank stragglers blocking the eval barrier)
+            if is_main and global_step % save_interval == 0:
+                save_checkpoint(config, d3pm, optim, global_step, f"{config['checkpoint_path']}/ckpt_{global_step}.pt")
+                save_checkpoint(config, d3pm, optim, global_step, f"{config['checkpoint_path']}/ckpt_latest.pt")
 
     # Final save
     if is_main:
