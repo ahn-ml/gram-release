@@ -456,8 +456,9 @@ def main():
     from utils.functions import load_model_class
 
     # Use checkpoint's arch config and update metadata fields
+    arch_extras = {k: v for k, v in config.arch.__pydantic_extra__.items() if k != 'temperature'}
     model_cfg = dict(
-        **config.arch.__pydantic_extra__,
+        **arch_extras,
         batch_size=config.global_batch_size,
         vocab_size=eval_metadata.vocab_size,
         seq_len=eval_metadata.seq_len,

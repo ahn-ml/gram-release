@@ -1,11 +1,14 @@
 from typing import Optional, Any, Sequence, List
 from dataclasses import dataclass
 import os
+import sys
 import math
 import yaml
 import shutil
 import copy
 import random
+
+sys.setrecursionlimit(50000)
 
 import numpy as np
 import torch
