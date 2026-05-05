@@ -47,8 +47,9 @@ def gen_d3pm(ckpt_path, num_samples, batch_size, device):
     model.eval()
 
     boards = []
+    disable_tqdm = os.environ.get("LOCAL_RANK", "0") != "0"
     with torch.inference_mode():
-        for i in tqdm(range(0, num_samples, batch_size), desc="d3pm gen"):
+        for i in tqdm(range(0, num_samples, batch_size), desc="d3pm gen", disable=disable_tqdm):
             cur = min(batch_size, num_samples - i)
             init_noise = make_init_noise(forward_type, cur, in_channels, img_size, N, device)
             conds = torch.full((cur,), N, dtype=torch.long, device=device)
@@ -97,8 +98,9 @@ def gen_trm(ckpt_dir, num_samples, batch_size, device, temperature=0.0):
     model.eval().to(device)
 
     boards = []
+    disable_tqdm = os.environ.get("LOCAL_RANK", "0") != "0"
     with torch.inference_mode():
-        for i in tqdm(range(0, num_samples, batch_size), desc="trm gen"):
+        for i in tqdm(range(0, num_samples, batch_size), desc="trm gen", disable=disable_tqdm):
             cur = min(batch_size, num_samples - i)
             batch = {
                 "inputs": torch.ones(cur, seq_len, dtype=torch.long, device=device),
@@ -132,16 +134,49 @@ def main():
     if args.num_samples <= 0 or args.batch_size <= 0:
         p.error("--num_samples and --batch_size must be positive")
 
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if args.model_type == "d3pm":
-        boards = gen_d3pm(args.checkpoint, args.num_samples, args.batch_size, device)
+    # Optional DDP: torchrun --nproc-per-node N sudoku_gen_eval.py ...
+    is_ddp = "LOCAL_RANK" in os.environ
+    if is_ddp:
+        import torch.distributed as dist
+        dist.init_process_group(backend="nccl")
+        rank, world = dist.get_rank(), dist.get_world_size()
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
     else:
-        boards = gen_trm(args.checkpoint, args.num_samples, args.batch_size, device,
-                         temperature=args.temperature)  # (N, 81) long
+        rank, world = 0, 1
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    torch.manual_seed(args.seed + rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + rank)
+
+    per_rank = (args.num_samples + world - 1) // world
+    local_n = max(0, min(per_rank, args.num_samples - rank * per_rank))
+
+    if local_n > 0:
+        if args.model_type == "d3pm":
+            local_boards = gen_d3pm(args.checkpoint, local_n, args.batch_size, device)
+        else:
+            local_boards = gen_trm(args.checkpoint, local_n, args.batch_size, device,
+                                   temperature=args.temperature)
+    else:
+        local_boards = torch.zeros(0, 81, dtype=torch.long)
+
+    if is_ddp:
+        # Pad to per_rank for all_gather (requires equal sizes), then trim on rank 0
+        if local_boards.shape[0] < per_rank:
+            pad = torch.zeros(per_rank - local_boards.shape[0], 81, dtype=local_boards.dtype)
+            local_boards = torch.cat([local_boards, pad], dim=0)
+        local_gpu = local_boards.to(device)
+        gathered = [torch.zeros_like(local_gpu) for _ in range(world)]
+        dist.all_gather(gathered, local_gpu)
+        if rank != 0:
+            dist.destroy_process_group()
+            return
+        boards = torch.cat(gathered, dim=0).cpu()[:args.num_samples]
+        dist.destroy_process_group()
+    else:
+        boards = local_boards
 
     # accuracy: verify against all-blank inputs (token 1 = blank)
     blanks = torch.ones_like(boards)
@@ -152,12 +187,18 @@ def main():
     valid_idx = np.where(valid)[0]
     unique_answers = len({arr[i].tobytes() for i in valid_idx}) if len(valid_idx) else 0
 
+    # --- Symmetry-aware unique (digit-relabel canonical, drop-in module) ---
+    from sudoku_canon import canon_digits_batch
+    canon_unique = (len({b.tobytes() for b in canon_digits_batch(arr[valid_idx])})
+                    if len(valid_idx) else 0)
+
     print(f"model_type:      {args.model_type}")
     print(f"checkpoint:      {args.checkpoint}")
     print(f"num_samples:     {args.num_samples}")
     print(f"accuracy:        {accuracy:.4f}  ({int(valid.sum())}/{len(valid)})")
     if len(valid_idx):
         print(f"unique_answers:  {unique_answers/len(valid_idx):.4f}  ({unique_answers}/{len(valid_idx)})")
+        print(f"unique_canon:    {canon_unique/len(valid_idx):.4f}  ({canon_unique}/{len(valid_idx)})  [digit-relabel]")
     else:
         print(f"unique_answers:  n/a (no valid boards)")
 

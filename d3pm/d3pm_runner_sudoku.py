@@ -170,7 +170,7 @@ def save_checkpoint(config, d3pm, optim, global_step, path, loader_epoch=0, batc
 
 
 def load_checkpoint(d3pm, optim, path, device, config):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     for key in [
         "data",
         "data_dir",
@@ -221,7 +221,7 @@ def load_rank_state(path, rank, global_step, loader_epoch, batch_offset, world_s
     state_path = rank_state_path(path, rank)
     if not os.path.exists(state_path):
         raise FileNotFoundError(state_path)
-    state = torch.load(state_path)
+    state = torch.load(state_path, weights_only=False)
     for key, expected in {
         "global_step": global_step,
         "loader_epoch": loader_epoch,
