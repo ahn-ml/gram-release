@@ -18,6 +18,7 @@ import sys
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from evaluators.sudoku_utils import batch_verify_sudoku
 
@@ -47,7 +48,7 @@ def gen_d3pm(ckpt_path, num_samples, batch_size, device):
 
     boards = []
     with torch.inference_mode():
-        for i in range(0, num_samples, batch_size):
+        for i in tqdm(range(0, num_samples, batch_size), desc="d3pm gen"):
             cur = min(batch_size, num_samples - i)
             init_noise = make_init_noise(forward_type, cur, in_channels, img_size, N, device)
             conds = torch.full((cur,), N, dtype=torch.long, device=device)
@@ -57,7 +58,11 @@ def gen_d3pm(ckpt_path, num_samples, batch_size, device):
 
 
 def gen_trm(ckpt_dir, num_samples, batch_size, device, temperature=0.0):
-    from pretrain import PretrainConfig  # noqa: F401  (used by checkpoint pickle)
+    import __main__
+    import pretrain  # checkpoint was pickled when pretrain.py was __main__
+    for name in ("PretrainConfig", "ArchConfig", "LossConfig", "EvaluatorConfig"):
+        if hasattr(pretrain, name):
+            setattr(__main__, name, getattr(pretrain, name))
     from utils.functions import load_model_class
     from evaluators.sampling_strategies import sample_parallel
 
@@ -93,7 +98,7 @@ def gen_trm(ckpt_dir, num_samples, batch_size, device, temperature=0.0):
 
     boards = []
     with torch.inference_mode():
-        for i in range(0, num_samples, batch_size):
+        for i in tqdm(range(0, num_samples, batch_size), desc="trm gen"):
             cur = min(batch_size, num_samples - i)
             batch = {
                 "inputs": torch.ones(cur, seq_len, dtype=torch.long, device=device),
@@ -119,6 +124,9 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--temperature", type=float, default=0.0,
                    help="TRM only: >0 enables multinomial sampling for diversity")
+    p.add_argument("--save_viz", type=str, default=None,
+                   help="If set, save correct/incorrect sample visualizations under this dir")
+    p.add_argument("--viz_n", type=int, default=16, help="boards per viz panel (4x4 default)")
     args = p.parse_args()
 
     if args.num_samples <= 0 or args.batch_size <= 0:
@@ -152,6 +160,26 @@ def main():
         print(f"unique_answers:  {unique_answers/len(valid_idx):.4f}  ({unique_answers}/{len(valid_idx)})")
     else:
         print(f"unique_answers:  n/a (no valid boards)")
+
+    if args.save_viz:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "d3pm"))
+        from d3pm_runner_sudoku import render_sudoku_grid, sudoku_conflicts
+        os.makedirs(args.save_viz, exist_ok=True)
+        n = args.viz_n
+        side = int(np.ceil(np.sqrt(n)))
+        invalid_idx = np.where(~valid)[0]
+        for label, idx in [("correct", valid_idx), ("incorrect", invalid_idx)]:
+            if len(idx) == 0:
+                continue
+            picks = idx[:n]
+            boards_2d = arr[picks].reshape(-1, 9, 9)
+            confs = [sudoku_conflicts(b) for b in boards_2d]
+            img = render_sudoku_grid(boards_2d, confs,
+                                     title=f"{label} samples ({len(picks)}/{n})",
+                                     rows=side, cols=side)
+            out = os.path.join(args.save_viz, f"{args.model_type}_{label}.png")
+            img.save(out)
+            print(f"viz:           saved {out}")
 
 
 if __name__ == "__main__":

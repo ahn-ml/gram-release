@@ -56,11 +56,10 @@ def _viz_font(size=15):
     return _VIZ_FONT
 
 
-def render_sudoku_grid(boards, conflicts_list=None, title=None, cell=48, gap=12):
+def render_sudoku_grid(boards, conflicts_list=None, title=None, cell=48, gap=12, rows=2, cols=2):
     """boards: (B,9,9) token space (PAD=0, blank=1, digits 2..10 = "1".."9").
-    conflicts_list: list of (9,9) bool masks or None. 2x2 layout for up to 4 boards.
+    conflicts_list: list of (9,9) bool masks or None. rows×cols layout (default 2x2).
     Conflicting cells get red bg + red digit; non-digit token→'?'."""
-    rows, cols = 2, 2
     bs = 9 * cell
     title_h = 24 if title else 0
     W = cols * bs + (cols + 1) * gap
