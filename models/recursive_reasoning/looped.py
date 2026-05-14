@@ -353,24 +353,18 @@ class LoopedTransformer(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
         )
 
-    def _forward_act_chain(
-        self,
-        inner_carry: LoopedTransformerInnerCarry,
-        data: Dict[str, torch.Tensor],
-    ) -> Tuple[LoopedTransformerCarry, Dict[str, torch.Tensor]]:
-        """act_grad_at_halt_only path: run the whole ACT chain in one call.
+    def _act_rollout(self, z: torch.Tensor, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """act_grad_at_halt_only — phase 1: roll the ACT chain out under no_grad.
 
-        Outer steps are rolled out under no_grad; q_halt (> 0) decides per-sample halting.
-        For each sample we snapshot the z that *enters* its halt step, then run a SINGLE
-        grad pass on the gathered halt-step inputs — so backbone gradient flows only from
-        the last K cycles of each sample's halt step. q_halt is exposed per rolled-out step
-        (the loss head supervises it at every step it was active).
+        q_halt (> 0) decides per-sample halting; for each sample we snapshot the z that
+        *enters* its halt step. q_halt is recomputed outside no_grad so gradient still
+        reaches q_head (the backbone stays detached). Returns the gathered halt-step inputs,
+        the per-sample halt step, and the per-rolled-out-step q_halt tensors.
         """
         B = data["inputs"].shape[0]
         device = data["inputs"].device
         halt_max = self.config.halt_max_steps
 
-        z = inner_carry.z
         halt_input_z = z.clone()                                       # per-sample z entering the halt step
         halted = torch.zeros(B, dtype=torch.bool, device=device)
         halt_step = torch.zeros(B, dtype=torch.int32, device=device)
@@ -407,8 +401,30 @@ class LoopedTransformer(nn.Module):
             if bool(halted.all()):
                 break
 
-        # Single grad pass: each sample resumes from the z entering its own halt step.
-        grad_carry = LoopedTransformerInnerCarry(z=halt_input_z)
+        return {
+            "halt_input_z": halt_input_z,
+            "halt_step": halt_step,
+            # Per rolled-out step (n_steps, B[, seq]) — loss head does masked multi-step q_halt BCE.
+            "q_halt_logits_steps": torch.stack(qh_steps, dim=0),
+            "q_halt_preds_steps": torch.stack(pred_steps, dim=0),
+            "q_halt_active_steps": torch.stack(active_steps, dim=0),
+        }
+
+    def _act_grad_pass(
+        self,
+        roll: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+    ) -> Tuple[LoopedTransformerCarry, Dict[str, torch.Tensor]]:
+        """act_grad_at_halt_only — phase 2: single grad pass at each sample's halt step.
+
+        Each sample resumes from the z that entered its own halt step (gathered by
+        _act_rollout), so backbone gradient flows only from the last K cycles of that step.
+        Returns the carry (halted=all True → next batch resets) and the loss-head outputs.
+        """
+        B = data["inputs"].shape[0]
+        device = data["inputs"].device
+
+        grad_carry = LoopedTransformerInnerCarry(z=roll["halt_input_z"])
         new_inner_carry, logits, (q_halt_logits, q_continue_logits), stacked_logits, vae_outputs = self.inner(grad_carry, data)
 
         outputs = {
@@ -416,15 +432,14 @@ class LoopedTransformer(nn.Module):
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits,
             "intermediate_logits": stacked_logits,
-            # Per rolled-out step (n_steps, B[, seq]) — loss head does masked multi-step q_halt BCE.
-            "q_halt_logits_steps": torch.stack(qh_steps, dim=0),
-            "q_halt_preds_steps": torch.stack(pred_steps, dim=0),
-            "q_halt_active_steps": torch.stack(active_steps, dim=0),
+            "q_halt_logits_steps": roll["q_halt_logits_steps"],
+            "q_halt_preds_steps": roll["q_halt_preds_steps"],
+            "q_halt_active_steps": roll["q_halt_active_steps"],
             **vae_outputs,
         }
         new_carry = LoopedTransformerCarry(
             inner_carry=LoopedTransformerInnerCarry(z=new_inner_carry.z),
-            steps=halt_step,
+            steps=roll["halt_step"],
             halted=torch.ones(B, dtype=torch.bool, device=device),     # chain done → next batch resets
             current_data=data,
         )
@@ -443,7 +458,7 @@ class LoopedTransformer(nn.Module):
         }
 
         if self.config.act_grad_at_halt_only and self.training and self.config.halt_max_steps > 1:
-            return self._forward_act_chain(new_inner_carry, new_current_data)
+            return self._act_grad_pass(self._act_rollout(new_inner_carry.z, new_current_data), new_current_data)
 
         new_inner_carry, logits, (q_halt_logits, q_continue_logits), stacked_logits, vae_outputs = self.inner(new_inner_carry, new_current_data)
 
