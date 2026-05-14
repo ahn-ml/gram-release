@@ -47,3 +47,8 @@ supervised_blocks: 3
 latent_dim: 256
 use_mlp_sampler: False
 kl_coef: 0.1            # only used when use_stochastic_guidance=True
+
+# ACT: gradient only at the predicted-halt step. When True (needs halt_max_steps > 1),
+# the full ACT chain runs in one forward() — no_grad rollout + single grad pass at the
+# per-sample halt step. backward() fires once per puzzle. Off → unchanged looped behaviour.
+act_grad_at_halt_only: False

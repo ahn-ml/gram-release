@@ -68,6 +68,15 @@ class LoopedTransformerConfig(BaseModel):
     latent_dim: int = 256
     use_mlp_sampler: bool = False
 
+    # ACT: gradient only at the predicted-halt step (TRM/GRAM-style q_halt halting).
+    # When True (requires halt_max_steps > 1 and training), the full ACT chain runs inside
+    # ONE forward() call: outer steps are rolled out under no_grad, q_halt (> 0) decides
+    # per-sample halting, and a SINGLE grad pass on each sample's halt-step input produces
+    # the supervised last-K-cycle readouts. backward() fires once per puzzle.
+    # q_halt is supervised at every rolled-out step (the loss head reads the *_steps tensors).
+    # Eval path and the vanilla (halt_max_steps=1) path are unaffected.
+    act_grad_at_halt_only: bool = False
+
 
 class LoopedTransformerBlock(nn.Module):
     def __init__(self, config: LoopedTransformerConfig) -> None:
@@ -344,6 +353,83 @@ class LoopedTransformer(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
         )
 
+    def _forward_act_chain(
+        self,
+        inner_carry: LoopedTransformerInnerCarry,
+        data: Dict[str, torch.Tensor],
+    ) -> Tuple[LoopedTransformerCarry, Dict[str, torch.Tensor]]:
+        """act_grad_at_halt_only path: run the whole ACT chain in one call.
+
+        Outer steps are rolled out under no_grad; q_halt (> 0) decides per-sample halting.
+        For each sample we snapshot the z that *enters* its halt step, then run a SINGLE
+        grad pass on the gathered halt-step inputs — so backbone gradient flows only from
+        the last K cycles of each sample's halt step. q_halt is exposed per rolled-out step
+        (the loss head supervises it at every step it was active).
+        """
+        B = data["inputs"].shape[0]
+        device = data["inputs"].device
+        halt_max = self.config.halt_max_steps
+
+        z = inner_carry.z
+        halt_input_z = z.clone()                                       # per-sample z entering the halt step
+        halted = torch.zeros(B, dtype=torch.bool, device=device)
+        halt_step = torch.zeros(B, dtype=torch.int32, device=device)
+
+        # Exploration: force a per-sample minimum number of steps before halting is allowed.
+        min_halt = (
+            (torch.rand(B, device=device) < self.config.halt_exploration_prob)
+            * torch.randint(2, halt_max + 1, (B,), device=device, dtype=torch.int32)
+        )
+
+        qh_steps, pred_steps, active_steps = [], [], []
+        for step in range(1, halt_max + 1):
+            active = ~halted
+            with torch.no_grad():
+                rolled, logits_s, _, _, _ = self.inner(
+                    LoopedTransformerInnerCarry(z=z), data
+                )
+            # q_halt recomputed outside no_grad so gradient reaches q_head (input stays detached).
+            qh = self.inner.q_head(rolled.z[:, 0]).to(torch.float32)[..., 0]
+            qh_steps.append(qh)
+            pred_steps.append(torch.argmax(logits_s, dim=-1))
+            active_steps.append(active)
+
+            if step >= halt_max:
+                newly = active                                         # last step: everyone halts
+            else:
+                newly = active & (qh.detach() > 0) & (step >= min_halt)
+            # INVARIANT: snapshot `z` (the *input* to this step) BEFORE `z = rolled.z` below,
+            # so halt_input_z holds the input to each sample's halt step, not its output.
+            halt_input_z = torch.where(newly.view(-1, 1, 1), z, halt_input_z)
+            halt_step = torch.where(newly, torch.full_like(halt_step, step), halt_step)
+            halted = halted | newly
+            z = rolled.z
+            if bool(halted.all()):
+                break
+
+        # Single grad pass: each sample resumes from the z entering its own halt step.
+        grad_carry = LoopedTransformerInnerCarry(z=halt_input_z)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), stacked_logits, vae_outputs = self.inner(grad_carry, data)
+
+        outputs = {
+            "logits": logits,
+            "q_halt_logits": q_halt_logits,
+            "q_continue_logits": q_continue_logits,
+            "intermediate_logits": stacked_logits,
+            # Per rolled-out step (n_steps, B[, seq]) — loss head does masked multi-step q_halt BCE.
+            "q_halt_logits_steps": torch.stack(qh_steps, dim=0),
+            "q_halt_preds_steps": torch.stack(pred_steps, dim=0),
+            "q_halt_active_steps": torch.stack(active_steps, dim=0),
+            **vae_outputs,
+        }
+        new_carry = LoopedTransformerCarry(
+            inner_carry=LoopedTransformerInnerCarry(z=new_inner_carry.z),
+            steps=halt_step,
+            halted=torch.ones(B, dtype=torch.bool, device=device),     # chain done → next batch resets
+            current_data=data,
+        )
+        return new_carry, outputs
+
     def forward(
         self,
         carry: LoopedTransformerCarry,
@@ -355,6 +441,9 @@ class LoopedTransformer(nn.Module):
             k: torch.where(carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v)
             for k, v in carry.current_data.items()
         }
+
+        if self.config.act_grad_at_halt_only and self.training and self.config.halt_max_steps > 1:
+            return self._forward_act_chain(new_inner_carry, new_current_data)
 
         new_inner_carry, logits, (q_halt_logits, q_continue_logits), stacked_logits, vae_outputs = self.inner(new_inner_carry, new_current_data)
 

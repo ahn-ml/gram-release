@@ -57,6 +57,19 @@ class ACTLossHead(nn.Module):
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
 
+    def _verify_seq(self, inputs, preds, labels, mask, loss_counts):
+        """Sequence-level correctness: constraint verification for nqueens / graph-coloring,
+        else exact label match. Used for the per-step q_halt target in the act_grad_at_halt_only
+        path (and mirrors the inline logic used for the halt-step seq_is_correct)."""
+        if self.is_nqueen:
+            from evaluators.nqueens_utils import batch_verify_nqueens
+            return batch_verify_nqueens(inputs, preds)
+        elif self.is_graph_coloring:
+            from evaluators.graph_coloring_utils import batch_verify_coloring
+            return batch_verify_coloring(inputs, preds)
+        else:
+            return (mask & (preds == labels)).sum(-1) == loss_counts
+
     def forward(
         self,
         return_keys: Sequence[str],
@@ -127,7 +140,27 @@ class ACTLossHead(nn.Module):
             ) / K
         else:
             lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
-        q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+        if "q_halt_logits_steps" in outputs:
+            # act_grad_at_halt_only path: the model rolled out the whole ACT chain and exposed
+            # q_halt at every step. Supervise each step's q_halt against that step's correctness,
+            # masked to samples still active at that step. Normalised by n_steps so the scale
+            # stays comparable to the single-step BCE below. Note: late-halting samples
+            # contribute more (sample, step) terms — denser q_halt supervision, by design.
+            qh_steps = outputs["q_halt_logits_steps"]       # (n_steps, B)
+            preds_steps = outputs["q_halt_preds_steps"]     # (n_steps, B, seq)
+            active_steps = outputs["q_halt_active_steps"]   # (n_steps, B)
+            n_steps = qh_steps.shape[0]
+            step_inputs = new_carry.current_data["inputs"]
+            q_halt_loss = 0
+            for st in range(n_steps):
+                sic_st = self._verify_seq(step_inputs, preds_steps[st], labels, mask, loss_counts)
+                bce_st = F.binary_cross_entropy_with_logits(
+                    qh_steps[st], sic_st.to(qh_steps.dtype), reduction="none"
+                )
+                q_halt_loss = q_halt_loss + (bce_st * active_steps[st].to(bce_st.dtype)).sum()
+            q_halt_loss = q_halt_loss / n_steps
+        else:
+            q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
