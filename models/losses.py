@@ -49,10 +49,12 @@ class ACTLossHead(nn.Module):
         # Detect task type from data_path for task-specific verification
         self.is_nqueen = False
         self.is_graph_coloring = False
+        self.is_sudoku = False
         if data_path is not None:
             data_path_lower = data_path.lower()
             self.is_nqueen = 'nqueen' in data_path_lower
             self.is_graph_coloring = 'graph-coloring' in data_path_lower or 'graph_coloring' in data_path_lower
+            self.is_sudoku = 'sudoku' in data_path_lower
 
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
@@ -95,6 +97,10 @@ class ACTLossHead(nn.Module):
                 from evaluators.graph_coloring_utils import batch_verify_coloring
                 inputs = new_carry.current_data["inputs"]
                 seq_is_correct = batch_verify_coloring(inputs, preds)
+            elif self.is_sudoku:
+                from evaluators.sudoku_utils import batch_verify_sudoku
+                inputs = new_carry.current_data["inputs"]
+                seq_is_correct = batch_verify_sudoku(inputs, preds)
             else:
                 # Fallback to label matching for other tasks
                 is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
@@ -166,7 +172,7 @@ class ACTLossHead(nn.Module):
         value_loss = 0
         if "value_pred" in outputs:
             # Compute current accuracy (what the value should predict)
-            current_accuracy = (is_correct.sum(-1).float() / loss_counts.clamp_min(1).float())
+            current_accuracy = seq_is_correct.float() if self.is_sudoku else (is_correct.sum(-1).float() / loss_counts.clamp_min(1).float())
             # MSE loss between predicted value and current accuracy
             value_loss = F.mse_loss(outputs["value_pred"], current_accuracy, reduction="sum")
             metrics["value_loss"] = value_loss.detach()

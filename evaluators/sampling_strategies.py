@@ -5,7 +5,7 @@ import torch
 def compute_seq_correctness(inputs, labels, predictions, device, data_path=None):
     """Compute sequence-level correctness with task-specific verification.
 
-    For graph coloring: Uses constraint + canonical form verification.
+    For graph coloring / N-Queens / Sudoku: Uses constraint verification.
     For other tasks: Uses exact label matching.
     """
     IGNORE_LABEL_ID = -100
@@ -20,11 +20,13 @@ def compute_seq_correctness(inputs, labels, predictions, device, data_path=None)
     # Detect task type from data_path (more reliable than vocab size)
     is_graph_coloring = False
     is_nqueens = False
+    is_sudoku = False
 
     if data_path is not None:
         data_path_lower = data_path.lower() if isinstance(data_path, str) else ""
         is_nqueens = 'nqueens' in data_path_lower
         is_graph_coloring = ('graph-coloring' in data_path_lower or 'graph_coloring' in data_path_lower)
+        is_sudoku = 'sudoku' in data_path_lower
 
     if is_graph_coloring:
         # Use constraint + canonical form verification for graph coloring
@@ -34,6 +36,9 @@ def compute_seq_correctness(inputs, labels, predictions, device, data_path=None)
         # Use n-queens specific verification
         from evaluators.nqueens_utils import batch_verify_nqueens
         seq_is_correct = batch_verify_nqueens(inputs, predictions)
+    elif is_sudoku:
+        from evaluators.sudoku_utils import batch_verify_sudoku
+        seq_is_correct = batch_verify_sudoku(inputs, predictions)
     else:
         # Use exact matching for other puzzles
         seq_is_correct = (is_correct.sum(-1) == loss_counts) & (loss_counts > 0)

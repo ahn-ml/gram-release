@@ -46,6 +46,9 @@ python -m dataset.build_arc_dataset \
 # Sudoku-Extreme
 python dataset/build_sudoku_dataset.py --output-dir data/sudoku-extreme-1k-aug-1000  --subsample-size 1000 --num-aug 1000  # 1000 examples, 1000 augments
 
+# Sudoku Generation (blank board -> valid solution)
+python dataset/build_sudoku_generation_dataset.py --output-dir data/sudoku-generation-50k --train-size 50000 --test-size 10000
+
 # N-Queens
 python dataset/build_nqueens_dataset.py --n 8 --remove-counts 5 6 7 --output-dir data/nqueens-8
 python dataset/build_nqueens_dataset.py --n 10 --remove-counts 7 8 9 --output-dir data/nqueens-10
@@ -69,6 +72,9 @@ bash scripts/arc2.sh
 
 # Sudoku-Extreme (8 RTX 4090 GPUs, < 2 hours)
 bash scripts/sudoku.sh
+
+# Sudoku Generation (8 RTX 4090 GPUs)
+bash scripts/sudoku_generation.sh
 
 # N-Queens (8 RTX 4090 GPUs, ~1 hour, ~3 hours)
 bash scripts/nqueens_8.sh
